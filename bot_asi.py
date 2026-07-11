@@ -40,8 +40,10 @@ logger = logging.getLogger(__name__)
 # =========================
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 
@@ -444,6 +446,10 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Reminder sudah dihentikan ✅\n\n"
         "Ketik /start untuk mengaktifkan lagi."
     )
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot aktif dan berjalan normal.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -872,6 +878,7 @@ async def post_init(application: Application):
         ("stats", "Statistik hari ini"),
         ("stop", "Hentikan reminder"),
         ("help", "Bantuan"),
+        ("health", "Cek status bot"),
     ])
 
     # Kalau bot restart, jadwal reminder akan dibuat ulang dari data terakhir
@@ -879,7 +886,7 @@ async def post_init(application: Application):
         reschedule_from_last(application, chat_id)
         schedule_daily_summary(application, chat_id)
 
-    logger.info("Baby Care Bot siap berjalan.")
+    logger.info("Baby Care Bot siap berjalan dengan mode hemat resource.")
 
 
 def main():
@@ -893,13 +900,18 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     print("Baby Care Bot berjalan...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        poll_interval=2.0,
+        timeout=20,
+    )
 
 
 if __name__ == "__main__":

@@ -36,3 +36,25 @@ BOT_TOKEN=token_bot_kamu
 /stats - statistik hari ini
 /stop - hentikan reminder
 /help - bantuan
+
+
+## Optimasi Railway
+
+Versi ini dibuat lebih ringan untuk pemakaian pribadi:
+
+- SQLite tetap digunakan agar ringan.
+- SQLite memakai WAL dan synchronous NORMAL.
+- Long polling dibuat lebih santai.
+- Reminder hanya berjalan saat diperlukan.
+- Gunakan `/health` untuk mengecek status bot.
+
+Environment variable yang disarankan:
+
+```
+BOT_TOKEN=token_bot_kamu
+TIMEZONE=Asia/Jakarta
+DEFAULT_ASI_MINUTES=150
+DEFAULT_POPOK_MINUTES=240
+DEFAULT_PUMP_MINUTES=120
+DEFAULT_SNOOZE_MINUTES=15
+```
