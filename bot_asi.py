@@ -254,6 +254,19 @@ def reminder_menu(kind: str):
     ])
 
 
+def pump_amount_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("30 ml", callback_data="pump_ml_30"),
+         InlineKeyboardButton("60 ml", callback_data="pump_ml_60"),
+         InlineKeyboardButton("90 ml", callback_data="pump_ml_90")],
+        [InlineKeyboardButton("120 ml", callback_data="pump_ml_120"),
+         InlineKeyboardButton("150 ml", callback_data="pump_ml_150"),
+         InlineKeyboardButton("180 ml", callback_data="pump_ml_180")],
+        [InlineKeyboardButton("✍️ Input Manual", callback_data="pump_manual")],
+        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
 def milk_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🍼 ASIP 30 ml", callback_data="milk_asip_30"),
@@ -386,14 +399,57 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    await context.bot.send_message(chat_id=chat_id, text=build_stats(chat_id), reply_markup=main_menu())
+
+    nama_hari = {
+        0: "Senin",
+        1: "Selasa",
+        2: "Rabu",
+        3: "Kamis",
+        4: "Jumat",
+        5: "Sabtu",
+        6: "Minggu",
+    }
+
+    nama_bulan = {
+        1: "Januari",
+        2: "Februari",
+        3: "Maret",
+        4: "April",
+        5: "Mei",
+        6: "Juni",
+        7: "Juli",
+        8: "Agustus",
+        9: "September",
+        10: "Oktober",
+        11: "November",
+        12: "Desember",
+    }
+
+    sekarang = now_local()
+    tanggal = (
+        f"{nama_hari[sekarang.weekday()]}, "
+        f"{sekarang.day} {nama_bulan[sekarang.month]} {sekarang.year}"
+    )
+
+    summary = (
+        "🌙 Ringkasan Harian\n"
+        f"📅 {tanggal}\n"
+        "🕚 Pukul 23.59 WIB\n\n"
+        + build_stats(chat_id)
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=summary,
+        reply_markup=main_menu(),
+    )
 
 
 def schedule_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     clear_jobs(context, chat_id, "summary")
     context.job_queue.run_daily(
         daily_summary_job,
-        time=now_local().replace(hour=21, minute=0, second=0, microsecond=0).timetz(),
+        time=now_local().replace(hour=23, minute=59, second=0, microsecond=0).timetz(),
         chat_id=chat_id,
         name=f"summary_{chat_id}",
     )
@@ -520,12 +576,36 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "pompa_asi":
-        set_state(chat_id, "WAIT_PUMP_ML")
         await query.edit_message_text(
             "🤱 Catat Pompa ASI\n\n"
             "Berapa total ASI yang berhasil dipompa?\n"
-            "Ketik jumlahnya dalam ml.\n\n"
-            "Contoh: 80"
+            "Pilih jumlah di bawah atau masukkan secara manual.",
+            reply_markup=pump_amount_menu(),
+        )
+        return
+
+    if data.startswith("pump_ml_"):
+        amount = int(data.split("_")[-1])
+        add_event(chat_id, "pump", amount_ml=amount)
+        schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
+        next_pump = now_local() + timedelta(minutes=DEFAULT_PUMP_MINUTES)
+
+        await query.edit_message_text(
+            f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
+            f"Hasil pompa: {amount} ml\n"
+            f"Jam: {now_local().strftime('%H:%M')}\n"
+            f"⏰ Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
+            "Semangat, Bunda ❤️",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if data == "pump_manual":
+        set_state(chat_id, "WAIT_PUMP_ML")
+        await query.edit_message_text(
+            "✍️ Input Manual Hasil Pompa\n\n"
+            "Ketik jumlah ASI yang berhasil dipompa dalam ml.\n\n"
+            "Contoh: 75"
         )
         return
 

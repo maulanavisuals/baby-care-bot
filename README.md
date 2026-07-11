@@ -58,3 +58,9 @@ DEFAULT_POPOK_MINUTES=240
 DEFAULT_PUMP_MINUTES=120
 DEFAULT_SNOOZE_MINUTES=15
 ```
+
+- Statistik harian otomatis dikirim setiap pukul 23.59 WIB.
+
+- Ringkasan harian menampilkan hari dan tanggal lengkap dalam Bahasa Indonesia.
+
+- Catatan pompa ASI menyediakan pilihan cepat 30–180 ml dan input jumlah ml secara manual.
