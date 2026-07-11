@@ -69,9 +69,6 @@ DEFAULT_SNOOZE_MINUTES=15
 
 - Reminder menyusu dan pompa ASI akan diulang setiap 15 menit sampai aktivitas dicatat.
 
-- Reminder menyusu dan pompa ASI sekarang mengirim audio alarm.
-- Audio alarm akan ikut terkirim setiap 15 menit sampai aktivitas dikonfirmasi.
-- Pastikan file `alarm.wav` ikut di-upload ke GitHub.
 
 - Timer menyusu kiri/kanan dan durasi otomatis.
 - Detail popok: pipis, BAB, atau keduanya.
@@ -81,5 +78,21 @@ DEFAULT_SNOOZE_MINUTES=15
 
 - Menu Catat ASIP sekarang khusus ASIP.
 - Pilihan cepat 30, 60, 90, 120, 150, 180 ml dan input manual.
-- Reminder ASIP memakai audio alarm dan berulang setiap 15 menit sampai jumlah ml dicatat.
 - Setelah dicatat, reminder ASIP berikutnya mengikuti interval menyusu.
+- Audio alarm dihapus. Reminder sekarang berupa notifikasi teks yang lebih rapi dan tetap berulang.
+
+- Fitur perkembangan bayi: berat dan panjang saat lahir, keluar RS, dan setiap kontrol DSA.
+- Setiap kontrol DSA dapat memilih tanggal pencatatan.
+- Riwayat perkembangan menampilkan perubahan berat dibanding berat lahir.
+- Data perkembangan terakhir ditampilkan di Profil Bayi.
+
+- Menyusu langsung tidak memiliki reminder otomatis.
+- Reminder aktif hanya untuk ASIP, ganti popok, dan pompa ASI.
+- Interval sebelumnya yang bernama interval menyusu kini dipakai sebagai interval ASIP.
+
+- Mode Keluarga: beberapa akun Telegram dapat memakai satu data bayi yang sama.
+- Akun kedua dapat bergabung menggunakan kode keluarga.
+- Statistik, riwayat, profil, dan perkembangan bayi tersinkron.
+- Setiap anggota dapat mengatur nama/peran seperti Ayah, Bunda, Nenek, atau Pengasuh.
+- Aktivitas penting dapat memberi notifikasi sinkronisasi ke anggota keluarga lain.
+- Reminder berjalan pada setiap akun keluarga yang sudah membuka/mengaktifkan bot.

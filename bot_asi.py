@@ -21,7 +21,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "baby_care.db")
-ALARM_FILE = os.getenv("ALARM_FILE", "alarm.wav")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
 
 DEFAULT_ASI_MINUTES = int(os.getenv("DEFAULT_ASI_MINUTES", "150"))       # 2 jam 30 menit
@@ -47,6 +46,152 @@ def db():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
+
+
+def generate_family_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "BAYI-" + "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def get_family_by_chat(chat_id: int):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT f.*, fm.role_name
+            FROM family_members fm
+            JOIN families f ON f.id = fm.family_id
+            WHERE fm.chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+
+
+def get_family_members(chat_id: int):
+    family = get_family_by_chat(chat_id)
+    if not family:
+        return []
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT chat_id, role_name, joined_at
+            FROM family_members
+            WHERE family_id = ?
+            ORDER BY joined_at ASC
+            """,
+            (family["id"],),
+        ).fetchall()
+
+
+def get_data_chat_id(chat_id: int) -> int:
+    family = get_family_by_chat(chat_id)
+    return int(family["owner_chat_id"]) if family else chat_id
+
+
+def ensure_family(chat_id: int, role_name: str = None):
+    existing = get_family_by_chat(chat_id)
+    if existing:
+        return existing
+
+    with db() as conn:
+        code_value = generate_family_code()
+        while conn.execute(
+            "SELECT 1 FROM families WHERE family_code = ?",
+            (code_value,),
+        ).fetchone():
+            code_value = generate_family_code()
+
+        cur = conn.execute(
+            """
+            INSERT INTO families (family_code, owner_chat_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (code_value, chat_id, iso(now_local())),
+        )
+        family_id = cur.lastrowid
+        conn.execute(
+            """
+            INSERT INTO family_members (chat_id, family_id, role_name, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, family_id, role_name or "Pemilik", iso(now_local())),
+        )
+
+    return get_family_by_chat(chat_id)
+
+
+def join_family(chat_id: int, family_code: str, role_name: str = None):
+    family_code = family_code.strip().upper()
+    with db() as conn:
+        family = conn.execute(
+            "SELECT * FROM families WHERE family_code = ?",
+            (family_code,),
+        ).fetchone()
+
+        if not family:
+            return False, "Kode keluarga tidak ditemukan."
+
+        existing = conn.execute(
+            "SELECT * FROM family_members WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "DELETE FROM family_members WHERE chat_id = ?",
+                (chat_id,),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO family_members (chat_id, family_id, role_name, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                family["id"],
+                role_name or "Anggota",
+                iso(now_local()),
+            ),
+        )
+
+    return True, None
+
+
+def leave_family(chat_id: int):
+    family = get_family_by_chat(chat_id)
+    if not family:
+        return False, "Belum tergabung dalam keluarga."
+
+    if int(family["owner_chat_id"]) == chat_id:
+        return False, "Pemilik keluarga tidak bisa keluar. Anggota lain tetap bisa menggunakan kode keluarga."
+
+    with db() as conn:
+        conn.execute("DELETE FROM family_members WHERE chat_id = ?", (chat_id,))
+    return True, None
+
+
+async def notify_family_members(
+    context: ContextTypes.DEFAULT_TYPE,
+    source_chat_id: int,
+    text: str,
+):
+    members = get_family_members(source_chat_id)
+    for member in members:
+        target = int(member["chat_id"])
+        if target == source_chat_id:
+            continue
+        try:
+            await context.bot.send_message(chat_id=target, text=text)
+        except Exception as exc:
+            logger.warning("Gagal mengirim sinkronisasi keluarga ke %s: %s", target, exc)
+
+
+def recorder_name(chat_id: int) -> str:
+    family = get_family_by_chat(chat_id)
+    if family and family["role_name"]:
+        return family["role_name"]
+    return "Keluarga"
 
 
 def init_db():
@@ -81,6 +226,38 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS families (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                family_code TEXT UNIQUE NOT NULL,
+                owner_chat_id INTEGER UNIQUE NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_members (
+                chat_id INTEGER PRIMARY KEY,
+                family_id INTEGER NOT NULL,
+                role_name TEXT,
+                joined_at TEXT NOT NULL,
+                FOREIGN KEY (family_id) REFERENCES families(id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS growth_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                record_date TEXT NOT NULL,
+                weight_kg REAL,
+                length_cm REAL,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         # Migrasi database lama: tambahkan kolom tanggal lahir jika belum ada
         columns = [row["name"] for row in conn.execute("PRAGMA table_info(chats)").fetchall()]
         if "birth_date" not in columns:
@@ -100,6 +277,7 @@ def parse_dt(value: str) -> datetime:
 
 
 def ensure_chat(chat_id: int):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         conn.execute(
             """
@@ -111,6 +289,7 @@ def ensure_chat(chat_id: int):
 
 
 def get_chat(chat_id: int):
+    chat_id = get_data_chat_id(chat_id)
     ensure_chat(chat_id)
     with db() as conn:
         return conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -143,6 +322,7 @@ def add_event(chat_id: int, event_type: str, amount_ml: Optional[int] = None,
 
 
 def last_event(chat_id: int, event_type: str):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         return conn.execute(
             """
@@ -156,6 +336,7 @@ def last_event(chat_id: int, event_type: str):
 
 
 def last_event_any(chat_id: int):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         return conn.execute(
             """
@@ -191,6 +372,7 @@ def today_events(chat_id: int):
 
 
 def set_state(chat_id: int, state: Optional[str]):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         conn.execute(
             """
@@ -209,6 +391,7 @@ def get_state(chat_id: int) -> Optional[str]:
 
 
 def update_interval(chat_id: int, field: str, minutes: int):
+    chat_id = get_data_chat_id(chat_id)
     if field not in {"asi_minutes", "popok_minutes"}:
         return
     with db() as conn:
@@ -216,11 +399,75 @@ def update_interval(chat_id: int, field: str, minutes: int):
 
 
 def update_baby_name(chat_id: int, name: str):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         conn.execute("UPDATE chats SET baby_name = ? WHERE chat_id = ?", (name, chat_id))
 
 
+def add_growth_record(
+    chat_id: int,
+    record_type: str,
+    record_date: str,
+    weight_kg: float,
+    length_cm: float,
+    notes: Optional[str] = None,
+):
+    chat_id = get_data_chat_id(chat_id)
+    ensure_chat(chat_id)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO growth_records
+            (chat_id, record_type, record_date, weight_kg, length_cm, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                record_type,
+                record_date,
+                weight_kg,
+                length_cm,
+                notes,
+                iso(now_local()),
+            ),
+        )
+
+
+def get_growth_records(chat_id: int):
+    chat_id = get_data_chat_id(chat_id)
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM growth_records
+            WHERE chat_id = ?
+            ORDER BY date(record_date) ASC, id ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+
+
+def delete_last_growth_record(chat_id: int):
+    chat_id = get_data_chat_id(chat_id)
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM growth_records
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+
+        if not row:
+            return False
+
+        conn.execute("DELETE FROM growth_records WHERE id = ?", (row["id"],))
+        return True
+
+
 def update_birth_date(chat_id: int, birth_date: str):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         conn.execute("UPDATE chats SET birth_date = ? WHERE chat_id = ?", (birth_date, chat_id))
 
@@ -272,18 +519,20 @@ def format_birth_date(birth_date_str: str) -> str:
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍼 Menyusu Langsung", callback_data="menu_menyusu")],
-        [InlineKeyboardButton("💩 Catat Popok", callback_data="menu_popok")],
-        [InlineKeyboardButton("🍼 Catat ASIP", callback_data="menu_susu")],
-        [InlineKeyboardButton("🤱 Catat Pompa ASI", callback_data="pompa_asi")],
+        [InlineKeyboardButton("🍼 Menyusu", callback_data="menu_menyusu"),
+         InlineKeyboardButton("🍼 ASIP", callback_data="menu_susu")],
+        [InlineKeyboardButton("🤱 Pompa ASI", callback_data="pompa_asi"),
+         InlineKeyboardButton("💩 Popok", callback_data="menu_popok")],
         [InlineKeyboardButton("😴 Mulai Tidur", callback_data="mulai_tidur"),
          InlineKeyboardButton("☀️ Bangun", callback_data="bangun_tidur")],
-        [InlineKeyboardButton("⏳ Dashboard Jadwal", callback_data="dashboard")],
-        [InlineKeyboardButton("📊 Statistik Hari Ini", callback_data="statistik"),
-         InlineKeyboardButton("📈 Statistik 7 Hari", callback_data="statistik_7")],
-        [InlineKeyboardButton("🕘 Riwayat Terakhir", callback_data="riwayat")],
-        [InlineKeyboardButton("↩️ Hapus Input Terakhir", callback_data="reset_last")],
+        [InlineKeyboardButton("⏳ Jadwal Berikutnya", callback_data="dashboard")],
+        [InlineKeyboardButton("📊 Hari Ini", callback_data="statistik"),
+         InlineKeyboardButton("📈 7 Hari", callback_data="statistik_7")],
+        [InlineKeyboardButton("🕘 Riwayat", callback_data="riwayat"),
+         InlineKeyboardButton("↩️ Hapus Terakhir", callback_data="reset_last")],
         [InlineKeyboardButton("👶 Profil Bayi", callback_data="profil"),
+         InlineKeyboardButton("📏 Perkembangan", callback_data="growth_menu")],
+        [InlineKeyboardButton("👨‍👩‍👧 Mode Keluarga", callback_data="family_menu"),
          InlineKeyboardButton("⚙️ Pengaturan", callback_data="pengaturan")],
     ])
 
@@ -292,27 +541,27 @@ def reminder_menu(kind: str):
     if kind == "asi":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Sudah Menyusu", callback_data="catat_asi")],
-            [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_asi")],
+            [InlineKeyboardButton("⏰ Ingatkan Lagi 15 Menit", callback_data="snooze_asi")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
         ])
 
     if kind == "pump":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤱 Sudah Pompa ASI", callback_data="pompa_asi")],
-            [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_pump")],
+            [InlineKeyboardButton("✅ Sudah Pompa ASI", callback_data="pompa_asi")],
+            [InlineKeyboardButton("⏰ Ingatkan Lagi 15 Menit", callback_data="snooze_pump")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
         ])
 
     if kind == "asip":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🍼 Sudah Minum ASIP", callback_data="menu_susu")],
-            [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_asip")],
+            [InlineKeyboardButton("✅ Sudah Minum ASIP", callback_data="menu_susu")],
+            [InlineKeyboardButton("⏰ Ingatkan Lagi 15 Menit", callback_data="snooze_asip")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
         ])
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Sudah Ganti Popok", callback_data="catat_popok")],
-        [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_popok")],
+        [InlineKeyboardButton("⏰ Ingatkan Lagi 15 Menit", callback_data="snooze_popok")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
     ])
 
@@ -362,11 +611,33 @@ def milk_menu():
     ])
 
 
+def family_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Lihat Kode Keluarga", callback_data="family_code")],
+        [InlineKeyboardButton("➕ Gabung Keluarga", callback_data="family_join")],
+        [InlineKeyboardButton("✏️ Atur Nama/Peran Saya", callback_data="family_role")],
+        [InlineKeyboardButton("👥 Lihat Anggota", callback_data="family_members")],
+        [InlineKeyboardButton("🚪 Keluar dari Keluarga", callback_data="family_leave")],
+        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
+def growth_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚖️ Data Lahir", callback_data="growth_birth")],
+        [InlineKeyboardButton("🏥 Data Keluar RS", callback_data="growth_discharge")],
+        [InlineKeyboardButton("🩺 Tambah Kontrol DSA", callback_data="growth_checkup")],
+        [InlineKeyboardButton("📊 Lihat Perkembangan", callback_data="growth_history")],
+        [InlineKeyboardButton("↩️ Hapus Data Terakhir", callback_data="growth_delete_last")],
+        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
 def settings_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍼 ASI 2 jam", callback_data="set_asi_120"),
-         InlineKeyboardButton("🍼 ASI 2,5 jam", callback_data="set_asi_150"),
-         InlineKeyboardButton("🍼 ASI 3 jam", callback_data="set_asi_180")],
+        [InlineKeyboardButton("🍼 ASIP 2 jam", callback_data="set_asi_120"),
+         InlineKeyboardButton("🍼 ASIP 2,5 jam", callback_data="set_asi_150"),
+         InlineKeyboardButton("🍼 ASIP 3 jam", callback_data="set_asi_180")],
         [InlineKeyboardButton("💩 Popok 3 jam", callback_data="set_popok_180"),
          InlineKeyboardButton("💩 Popok 4 jam", callback_data="set_popok_240"),
          InlineKeyboardButton("💩 Popok 5 jam", callback_data="set_popok_300")],
@@ -374,21 +645,6 @@ def settings_menu():
         [InlineKeyboardButton("📅 Atur Tanggal Lahir", callback_data="ubah_tanggal_lahir")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
     ])
-
-
-async def send_alarm_audio(context: ContextTypes.DEFAULT_TYPE, chat_id: int, caption: str):
-    """Kirim audio alarm. Jika file gagal dikirim, reminder teks tetap berjalan."""
-    try:
-        with open(ALARM_FILE, "rb") as audio:
-            await context.bot.send_audio(
-                chat_id=chat_id,
-                audio=audio,
-                caption=caption,
-                title="Baby Care Alarm",
-                performer="Baby Care Bot",
-            )
-    except Exception as exc:
-        logger.warning("Gagal mengirim audio alarm ke %s: %s", chat_id, exc)
 
 
 # =========================
@@ -433,18 +689,18 @@ def reschedule_default(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 def reschedule_from_last(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     chat = get_chat(chat_id)
 
-    for kind, interval_field in [("asi", "asi_minutes"), ("popok", "popok_minutes")]:
-        last = last_event(chat_id, kind)
-        interval = int(chat[interval_field])
+    # Reminder hanya untuk popok, ASIP, dan pompa ASI.
+    last_popok = last_event(chat_id, "popok")
+    popok_interval = int(chat["popok_minutes"])
 
-        if last:
-            next_time = parse_dt(last["created_at"]) + timedelta(minutes=interval)
-            if next_time <= now_local():
-                schedule_once(context, chat_id, kind, 1)
-            else:
-                schedule_at(context, chat_id, kind, next_time)
+    if last_popok:
+        next_popok = parse_dt(last_popok["created_at"]) + timedelta(minutes=popok_interval)
+        if next_popok <= now_local():
+            schedule_once(context, chat_id, "popok", 1)
         else:
-            schedule_once(context, chat_id, kind, interval)
+            schedule_at(context, chat_id, "popok", next_popok)
+    else:
+        schedule_once(context, chat_id, "popok", popok_interval)
 
     last_asip = last_event(chat_id, "asip")
     if last_asip:
@@ -473,87 +729,53 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "asi":
         last = last_event(chat_id, "asi")
-        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
+        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "-"
         text = (
-            "🍼 Waktunya menyusu ya, Ayah & Bunda ❤️\n\n"
-            f"Terakhir menyusu: {last_text}\n\n"
-            f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
-            f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
+            "🍼 Waktunya Menyusu\n\n"
+            f"Terakhir menyusu: {last_text}\n"
+            f"Belum ada catatan baru. Aku akan mengingatkan lagi dalam "
+            f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit sampai aktivitas dicatat."
         )
-        await send_alarm_audio(
-            context,
-            chat_id,
-            "🚨 Alarm menyusu — segera cek si kecil ya."
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reminder_menu("asi")
-        )
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("asi"))
+        schedule_once(context, chat_id, "asi", DEFAULT_REPEAT_REMINDER_MINUTES)
+        return
 
-        # Ulangi terus sampai ada input menyusu baru.
-        schedule_once(
-            context,
-            chat_id,
-            "asi",
-            DEFAULT_REPEAT_REMINDER_MINUTES
-        )
-
-    elif kind == "asip":
+    if kind == "asip":
         last = last_event(chat_id, "asip")
-        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
+        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "-"
         text = (
-            "🍼 Waktunya ASIP untuk si kecil ❤️\n\n"
-            f"Terakhir minum ASIP: {last_text}\n\n"
-            f"Setelah diberikan, catat jumlah ml yang diminum. "
+            "🍼 Waktunya ASIP\n\n"
+            f"Terakhir minum ASIP: {last_text}\n"
+            "Setelah selesai, catat jumlah ASIP yang diminum dalam ml.\n"
             f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
             f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
         )
-        await send_alarm_audio(context, chat_id, "🚨 Alarm ASIP — waktunya si kecil minum ASIP.")
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("asip"))
         schedule_once(context, chat_id, "asip", DEFAULT_REPEAT_REMINDER_MINUTES)
+        return
 
-    elif kind == "pump":
+    if kind == "pump":
         last = last_event(chat_id, "pump")
-        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
+        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "-"
         text = (
-            "🤱 Waktunya pompa ASI, Bunda ❤️\n\n"
-            f"Terakhir pompa: {last_text}\n\n"
+            "🤱 Waktunya Pompa ASI\n\n"
+            f"Terakhir pompa: {last_text}\n"
+            "Setelah selesai, catat jumlah ASI yang berhasil dipompa.\n"
             f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
             f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
         )
-        await send_alarm_audio(
-            context,
-            chat_id,
-            "🚨 Alarm pompa ASI — waktunya pompa ya, Bunda."
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reminder_menu("pump")
-        )
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("pump"))
+        schedule_once(context, chat_id, "pump", DEFAULT_REPEAT_REMINDER_MINUTES)
+        return
 
-        # Ulangi terus sampai hasil pompa dicatat.
-        schedule_once(
-            context,
-            chat_id,
-            "pump",
-            DEFAULT_REPEAT_REMINDER_MINUTES
-        )
-
-    else:
-        last = last_event(chat_id, "popok")
-        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
-        text = (
-            "💩 Yuk cek popok si kecil.\n\n"
-            f"Terakhir ganti popok: {last_text}\n\n"
-            "Kalau sudah basah atau penuh, sebaiknya diganti supaya tetap nyaman."
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reminder_menu("popok")
-        )
+    last = last_event(chat_id, "popok")
+    last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "-"
+    text = (
+        "💩 Waktunya Cek Popok\n\n"
+        f"Terakhir ganti popok: {last_text}\n"
+        "Silakan cek apakah popok sudah basah atau penuh."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("popok"))
 
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
@@ -625,6 +847,7 @@ def format_duration_minutes(total_minutes: int) -> str:
 
 
 def recent_events(chat_id: int, limit: int = 10):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         return conn.execute(
             """
@@ -638,6 +861,7 @@ def recent_events(chat_id: int, limit: int = 10):
 
 
 def events_between(chat_id: int, start: datetime, end: datetime):
+    chat_id = get_data_chat_id(chat_id)
     with db() as conn:
         return conn.execute(
             """
@@ -649,6 +873,53 @@ def events_between(chat_id: int, start: datetime, end: datetime):
             """,
             (chat_id, iso(start), iso(end)),
         ).fetchall()
+
+
+def growth_type_label(record_type: str) -> str:
+    labels = {
+        "birth": "Lahir",
+        "discharge": "Keluar RS",
+        "checkup": "Kontrol DSA",
+    }
+    return labels.get(record_type, record_type)
+
+
+def format_growth_history(chat_id: int) -> str:
+    rows = get_growth_records(chat_id)
+
+    if not rows:
+        return (
+            "📏 Perkembangan Bayi\n\n"
+            "Belum ada data berat dan panjang yang dicatat."
+        )
+
+    lines = ["📏 Perkembangan Bayi", ""]
+    first_weight = None
+
+    for row in rows:
+        record_date = datetime.strptime(row["record_date"], "%Y-%m-%d").date()
+        date_text = f"{record_date.day:02d}-{record_date.month:02d}-{record_date.year}"
+        weight = row["weight_kg"]
+        length = row["length_cm"]
+
+        if first_weight is None and weight is not None:
+            first_weight = weight
+
+        change_text = ""
+        if first_weight is not None and weight is not None:
+            diff = weight - first_weight
+            sign = "+" if diff > 0 else ""
+            if abs(diff) >= 0.001:
+                change_text = f" ({sign}{diff:.2f} kg dari lahir)"
+
+        lines.append(f"{growth_type_label(row['record_type'])} — {date_text}")
+        lines.append(f"⚖️ {weight:.2f} kg{change_text}")
+        lines.append(f"📐 {length:.1f} cm")
+        if row["notes"]:
+            lines.append(f"📝 {row['notes']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 def event_label(event_type: str) -> str:
@@ -718,7 +989,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/menu - tampilkan menu\n"
         "/stats - statistik hari ini\n\n"
         "Tips: tekan tombol setiap selesai menyusui, ganti popok, atau si kecil tidur.\n"
-        "Kalau salah input, pilih ↩️ Hapus Input Terakhir."
+        "Menyusu langsung tidak memakai reminder. Reminder hanya untuk ASIP, popok, dan pompa ASI.\nKalau salah input, pilih ↩️ Hapus Input Terakhir."
     )
 
 
@@ -809,8 +1080,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_event(chat_id, "asi")
 
         chat = get_chat(chat_id)
-        schedule_once(context, chat_id, "asi", int(chat["asi_minutes"]))
-        next_time = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
+        clear_jobs(context, chat_id, "asi")
 
         await query.edit_message_text(
             f"✅ Menyusu selesai.\n\n"
@@ -831,6 +1101,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in {"popok_pipis", "popok_bab", "popok_keduanya"}:
         add_event(chat_id, data)
         add_event(chat_id, "popok")
+        await notify_family_members(
+            context,
+            chat_id,
+            f"{event_label(data)} dicatat oleh {recorder_name(chat_id)} pukul {now_local().strftime('%H:%M')}."
+        )
         chat = get_chat(chat_id)
         schedule_once(context, chat_id, "popok", int(chat["popok_minutes"]))
         label = event_label(data)
@@ -842,15 +1117,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "catat_asi":
         add_event(chat_id, "asi")
-        chat = get_chat(chat_id)
-        schedule_once(context, chat_id, "asi", int(chat["asi_minutes"]))
-        next_time = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
+        clear_jobs(context, chat_id, "asi")
+        await notify_family_members(
+            context,
+            chat_id,
+            f"🍼 Menyusu langsung dicatat oleh {recorder_name(chat_id)} pukul {now_local().strftime('%H:%M')}."
+        )
         await query.edit_message_text(
-            f"🎉 Sip, menyusu sudah tercatat!\n\n"
+            f"✅ Menyusu langsung berhasil dicatat\n\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
-            f"⏰ Reminder berulang dihentikan.\n"
-            f"Aku ingatkan lagi sekitar {next_time.strftime('%H:%M')}.\n\n"
-            "Semoga si kecil kenyang ya ❤️",
+            f"Dicatat oleh: {recorder_name(chat_id)}\n\n"
+            "Menyusu langsung tidak memakai reminder otomatis.",
             reply_markup=main_menu(),
         )
         return
@@ -881,11 +1158,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("pump_ml_"):
         amount = int(data.split("_")[-1])
         add_event(chat_id, "pump", amount_ml=amount)
+        await notify_family_members(
+            context,
+            chat_id,
+            f"🤱 Pompa ASI {amount} ml dicatat oleh {recorder_name(chat_id)} pukul {now_local().strftime('%H:%M')}."
+        )
         schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
         next_pump = now_local() + timedelta(minutes=DEFAULT_PUMP_MINUTES)
 
         await query.edit_message_text(
-            f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
+            f"✅ Pompa ASI berhasil dicatat\n\n"
             f"Hasil pompa: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
             f"⏰ Reminder berulang dihentikan.\n"
@@ -911,11 +1193,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("asip_") and data != "asip_manual":
         amount = int(data.split("_")[-1])
         add_event(chat_id, "asip", amount_ml=amount)
+        await notify_family_members(
+            context,
+            chat_id,
+            f"🍼 ASIP {amount} ml dicatat oleh {recorder_name(chat_id)} pukul {now_local().strftime('%H:%M')}."
+        )
         chat = get_chat(chat_id)
         schedule_once(context, chat_id, "asip", int(chat["asi_minutes"]))
         next_asip = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
         await query.edit_message_text(
-            f"✅ ASIP tercatat.\n\n"
+            f"✅ ASIP berhasil dicatat\n\n"
             f"Jumlah diminum: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
             f"⏰ Reminder ASIP berikutnya sekitar {next_asip.strftime('%H:%M')}.",
@@ -1063,8 +1350,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return f"{format_duration_minutes(delta)} lagi ({next_dt.strftime('%H:%M')})"
 
         text = (
-            "⏳ Dashboard Jadwal\n\n"
-            f"🍼 Menyusu: {next_text('asi', int(chat['asi_minutes']))}\n"
+            "⏳ Jadwal Berikutnya\n\n"
             f"🤱 Pompa ASI: {next_text('pump', DEFAULT_PUMP_MINUTES)}\n"
             f"🍼 ASIP: {next_text('asip', int(chat['asi_minutes']))}\n"
             f"💩 Cek popok: {next_text('popok', int(chat['popok_minutes']))}"
@@ -1128,6 +1414,117 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(build_stats(chat_id), reply_markup=main_menu())
         return
 
+    if data == "family_menu":
+        ensure_family(chat_id)
+        await query.edit_message_text(
+            "👨‍👩‍👧 Mode Keluarga\n\n"
+            "Hubungkan Telegram Ayah, Bunda, atau pengasuh ke satu data bayi yang sama.",
+            reply_markup=family_menu(),
+        )
+        return
+
+    if data == "family_code":
+        family = ensure_family(chat_id)
+        await query.edit_message_text(
+            "🔑 Kode Keluarga\n\n"
+            f"`{family['family_code']}`\n\n"
+            "Kirim kode ini hanya kepada keluarga yang ingin diberi akses. "
+            "Di akun Telegram kedua, buka Mode Keluarga → Gabung Keluarga.",
+            reply_markup=family_menu(),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "family_join":
+        set_state(chat_id, "WAIT_FAMILY_CODE")
+        await query.edit_message_text(
+            "➕ Gabung Keluarga\n\n"
+            "Ketik kode keluarga dari akun utama.\n"
+            "Contoh: BAYI-ABC123"
+        )
+        return
+
+    if data == "family_role":
+        set_state(chat_id, "WAIT_FAMILY_ROLE")
+        await query.edit_message_text(
+            "✏️ Atur Nama/Peran Saya\n\n"
+            "Ketik nama atau peran yang ingin ditampilkan.\n"
+            "Contoh: Ayah, Bunda, Nenek, atau Pengasuh"
+        )
+        return
+
+    if data == "family_members":
+        family = ensure_family(chat_id)
+        members = get_family_members(chat_id)
+        lines = ["👥 Anggota Keluarga", ""]
+        for i, member in enumerate(members, 1):
+            role = member["role_name"] or "Anggota"
+            owner_mark = " 👑" if int(member["chat_id"]) == int(family["owner_chat_id"]) else ""
+            lines.append(f"{i}. {role}{owner_mark}")
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=family_menu(),
+        )
+        return
+
+    if data == "family_leave":
+        ok, error = leave_family(chat_id)
+        if ok:
+            await query.edit_message_text(
+                "✅ Kamu sudah keluar dari keluarga.\n\n"
+                "Catatan keluarga lama tidak terhapus.",
+                reply_markup=main_menu(),
+            )
+        else:
+            await query.edit_message_text(
+                f"ℹ️ {error}",
+                reply_markup=family_menu(),
+            )
+        return
+
+    if data == "growth_menu":
+        await query.edit_message_text(
+            "📏 Perkembangan Bayi\n\n"
+            "Catat berat dan panjang bayi dari lahir, saat keluar RS, sampai setiap kontrol DSA.",
+            reply_markup=growth_menu(),
+        )
+        return
+
+    if data in {"growth_birth", "growth_discharge", "growth_checkup"}:
+        record_type = {
+            "growth_birth": "birth",
+            "growth_discharge": "discharge",
+            "growth_checkup": "checkup",
+        }[data]
+
+        context.user_data["growth_record_type"] = record_type
+        set_state(chat_id, "WAIT_GROWTH_DATE")
+
+        label = growth_type_label(record_type)
+        await query.edit_message_text(
+            f"📅 {label}\n\n"
+            "Ketik tanggal dengan format DD-MM-YYYY.\n\n"
+            "Contoh: 11-07-2026"
+        )
+        return
+
+    if data == "growth_history":
+        await query.edit_message_text(
+            format_growth_history(chat_id),
+            reply_markup=growth_menu(),
+        )
+        return
+
+    if data == "growth_delete_last":
+        deleted = delete_last_growth_record(chat_id)
+        text = (
+            "✅ Data perkembangan terakhir berhasil dihapus."
+            if deleted
+            else "Belum ada data perkembangan yang bisa dihapus."
+        )
+        await query.edit_message_text(text, reply_markup=growth_menu())
+        return
+
     if data == "profil":
         chat = get_chat(chat_id)
         baby_name = chat["baby_name"] or "belum diisi"
@@ -1140,12 +1537,23 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             birth_text = "belum diisi"
             age_text = "belum dapat dihitung"
 
+        growth_rows = get_growth_records(chat_id)
+        latest_growth = growth_rows[-1] if growth_rows else None
+
+        growth_text = ""
+        if latest_growth:
+            growth_text = (
+                f"\n⚖️ Berat terakhir: {latest_growth['weight_kg']:.2f} kg"
+                f"\n📐 Panjang terakhir: {latest_growth['length_cm']:.1f} cm"
+            )
+
         await query.edit_message_text(
             f"👶 Profil Bayi\n\n"
             f"Nama: {baby_name}\n"
             f"📅 Tanggal lahir: {birth_text}\n"
-            f"🎂 Umur: {age_text}\n\n"
-            "Umur akan dihitung otomatis setiap hari.",
+            f"🎂 Umur: {age_text}"
+            f"{growth_text}\n\n"
+            "Umur dihitung otomatis setiap hari.",
             reply_markup=main_menu(),
         )
         return
@@ -1154,7 +1562,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = get_chat(chat_id)
         await query.edit_message_text(
             "⚙️ Pengaturan\n\n"
-            f"🍼 Interval menyusu: {int(chat['asi_minutes'])} menit\n"
+            f"🍼 Interval ASIP: {int(chat['asi_minutes'])} menit\n"
             f"💩 Interval popok: {int(chat['popok_minutes'])} menit\n\n"
             "Pilih pengaturan:",
             reply_markup=settings_menu(),
@@ -1164,9 +1572,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("set_asi_"):
         minutes = int(data.split("_")[-1])
         update_interval(chat_id, "asi_minutes", minutes)
-        schedule_once(context, chat_id, "asi", minutes)
+        schedule_once(context, chat_id, "asip", minutes)
         await query.edit_message_text(
-            f"✅ Interval menyusu diubah menjadi {minutes} menit.",
+            f"✅ Interval ASIP diubah menjadi {minutes} menit.",
             reply_markup=settings_menu(),
         )
         return
@@ -1239,6 +1647,128 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     state = get_state(chat_id)
 
+    if state == "WAIT_FAMILY_CODE":
+        ok, error = join_family(chat_id, text)
+        set_state(chat_id, None)
+
+        if not ok:
+            await update.message.reply_text(
+                f"❌ {error}\n\nPeriksa kembali kode keluarga."
+            )
+            return
+
+        ensure_chat(chat_id)
+        # Jadwalkan reminder untuk akun yang baru bergabung.
+        reschedule_from_last(context, chat_id)
+
+        await update.message.reply_text(
+            "✅ Berhasil bergabung ke keluarga.\n\n"
+            "Sekarang data bayi, riwayat, statistik, dan perkembangan memakai data yang sama.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if state == "WAIT_FAMILY_ROLE":
+        role = text.strip()[:30]
+        family = ensure_family(chat_id)
+        with db() as conn:
+            conn.execute(
+                "UPDATE family_members SET role_name = ? WHERE chat_id = ?",
+                (role, chat_id),
+            )
+        set_state(chat_id, None)
+        await update.message.reply_text(
+            f"✅ Nama/peran disimpan: {role}",
+            reply_markup=family_menu(),
+        )
+        return
+
+    if state == "WAIT_GROWTH_DATE":
+        try:
+            record_date = datetime.strptime(text, "%d-%m-%Y").date()
+            if record_date > now_local().date():
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Tanggal tidak valid. Gunakan format DD-MM-YYYY.\n"
+                "Contoh: 11-07-2026"
+            )
+            return
+
+        context.user_data["growth_record_date"] = record_date.strftime("%Y-%m-%d")
+        set_state(chat_id, "WAIT_GROWTH_WEIGHT")
+
+        await update.message.reply_text(
+            "⚖️ Masukkan berat bayi dalam kilogram.\n\n"
+            "Contoh: 3.25"
+        )
+        return
+
+    if state == "WAIT_GROWTH_WEIGHT":
+        try:
+            weight = float(text.replace(",", "."))
+            if weight <= 0 or weight > 30:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Berat tidak valid. Masukkan angka dalam kilogram.\n"
+                "Contoh: 3.25"
+            )
+            return
+
+        context.user_data["growth_weight"] = weight
+        set_state(chat_id, "WAIT_GROWTH_LENGTH")
+
+        await update.message.reply_text(
+            "📐 Masukkan panjang badan bayi dalam cm.\n\n"
+            "Contoh: 50"
+        )
+        return
+
+    if state == "WAIT_GROWTH_LENGTH":
+        try:
+            length_cm = float(text.replace(",", "."))
+            if length_cm <= 0 or length_cm > 150:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Panjang badan tidak valid. Masukkan angka dalam cm.\n"
+                "Contoh: 50"
+            )
+            return
+
+        record_type = context.user_data.get("growth_record_type")
+        record_date = context.user_data.get("growth_record_date")
+        weight = context.user_data.get("growth_weight")
+
+        if not record_type or not record_date or weight is None:
+            set_state(chat_id, None)
+            await update.message.reply_text(
+                "Data perkembangan belum lengkap. Silakan ulangi dari menu 📏 Perkembangan.",
+                reply_markup=main_menu(),
+            )
+            return
+
+        add_growth_record(
+            chat_id=chat_id,
+            record_type=record_type,
+            record_date=record_date,
+            weight_kg=weight,
+            length_cm=length_cm,
+        )
+
+        set_state(chat_id, None)
+
+        await update.message.reply_text(
+            f"✅ Data perkembangan berhasil disimpan\n\n"
+            f"Jenis: {growth_type_label(record_type)}\n"
+            f"Tanggal: {datetime.strptime(record_date, '%Y-%m-%d').strftime('%d-%m-%Y')}\n"
+            f"Berat: {weight:.2f} kg\n"
+            f"Panjang: {length_cm:.1f} cm",
+            reply_markup=growth_menu(),
+        )
+        return
+
     if state == "WAIT_BABY_NAME":
         update_baby_name(chat_id, text)
         set_state(chat_id, None)
@@ -1288,7 +1818,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
         next_pump = now_local() + timedelta(minutes=DEFAULT_PUMP_MINUTES)
         await update.message.reply_text(
-            f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
+            f"✅ Pompa ASI berhasil dicatat\n\n"
             f"Hasil pompa: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
             f"⏰ Reminder berulang dihentikan.\n"
@@ -1313,7 +1843,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_once(context, chat_id, "asip", int(chat["asi_minutes"]))
         next_asip = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
         await update.message.reply_text(
-            f"✅ ASIP tercatat.\n\n"
+            f"✅ ASIP berhasil dicatat\n\n"
             f"Jumlah diminum: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
             f"⏰ Reminder ASIP berikutnya sekitar {next_asip.strftime('%H:%M')}.",
@@ -1383,7 +1913,7 @@ def build_stats(chat_id: int) -> str:
     last_popok_text = parse_dt(last_popok["created_at"]).strftime("%H:%M") if last_popok else "-"
 
     return (
-        "📊 Catatan Hari Ini\n\n"
+        "📊 Ringkasan Hari Ini\n\n"
         f"🍼 Menyusu: {count_asi} kali\n"
         f"⏱️ Durasi menyusu: {format_duration_minutes(bf_minutes)}\n"
         f"💩 Ganti popok: {count_popok} kali\n"
