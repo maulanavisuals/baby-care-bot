@@ -1,9 +1,22 @@
 import os
 import sqlite3
 import logging
+import secrets
+import tempfile
+from io import BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -528,6 +541,7 @@ def main_menu():
         [InlineKeyboardButton("⏳ Jadwal Berikutnya", callback_data="dashboard")],
         [InlineKeyboardButton("📊 Hari Ini", callback_data="statistik"),
          InlineKeyboardButton("📈 7 Hari", callback_data="statistik_7")],
+        [InlineKeyboardButton("📄 Export PDF Mingguan", callback_data="export_weekly_pdf")],
         [InlineKeyboardButton("🕘 Riwayat", callback_data="riwayat"),
          InlineKeyboardButton("↩️ Hapus Terakhir", callback_data="reset_last")],
         [InlineKeyboardButton("👶 Profil Bayi", callback_data="profil"),
@@ -812,10 +826,31 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
         f"{sekarang.day} {nama_bulan[sekarang.month]} {sekarang.year}"
     )
 
+    chat = get_chat(chat_id)
+    baby_name = chat["baby_name"] or "Belum diisi"
+
+    birth_date = chat["birth_date"] if "birth_date" in chat.keys() else None
+    age_text = calculate_age(birth_date) if birth_date else "Belum dapat dihitung"
+
+    growth_rows = get_growth_records(chat_id)
+    latest_growth = growth_rows[-1] if growth_rows else None
+
+    if latest_growth:
+        weight_text = f"{latest_growth['weight_kg']:.2f} kg"
+        length_text = f"{latest_growth['length_cm']:.1f} cm"
+    else:
+        weight_text = "Belum ada data"
+        length_text = "Belum ada data"
+
     summary = (
         "🌙 Ringkasan Harian\n"
         f"📅 {tanggal}\n"
         "🕚 Pukul 23.59 WIB\n\n"
+        "👶 Profil Bayi\n"
+        f"Nama: {baby_name}\n"
+        f"Umur: {age_text}\n"
+        f"Berat terbaru: {weight_text}\n"
+        f"Panjang terbaru: {length_text}\n\n"
         + build_stats(chat_id)
     )
 
@@ -941,6 +976,301 @@ def event_label(event_type: str) -> str:
     return labels.get(event_type, event_type)
 
 
+
+def get_weekly_data(chat_id: int):
+    end = now_local()
+    start = (end - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_exclusive = (end + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = events_between(chat_id, start, end_exclusive)
+    days = [start + timedelta(days=i) for i in range(7)]
+
+    result = []
+    for day in days:
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        daily = [
+            r for r in rows
+            if day_start <= parse_dt(r["created_at"]) < day_end
+        ]
+
+        sleep_minutes = 0
+        for e in daily:
+            if e["event_type"] == "sleep_end" and e["started_at"] and e["ended_at"]:
+                sleep_minutes += max(
+                    0,
+                    int(
+                        (
+                            parse_dt(e["ended_at"]) - parse_dt(e["started_at"])
+                        ).total_seconds() // 60
+                    ),
+                )
+
+        result.append({
+            "date": day_start,
+            "asi_count": sum(1 for e in daily if e["event_type"] == "asi"),
+            "asip_ml": sum((e["amount_ml"] or 0) for e in daily if e["event_type"] == "asip"),
+            "pump_ml": sum((e["amount_ml"] or 0) for e in daily if e["event_type"] == "pump"),
+            "popok_count": sum(1 for e in daily if e["event_type"] == "popok"),
+            "sleep_hours": sleep_minutes / 60,
+        })
+
+    return start, end, result
+
+
+def build_weekly_pdf(chat_id: int) -> str:
+    data_chat_id = get_data_chat_id(chat_id)
+    start, end, weekly = get_weekly_data(data_chat_id)
+
+    chat = get_chat(data_chat_id)
+    baby_name = chat["baby_name"] or "Belum diisi"
+    birth_date = chat["birth_date"] if "birth_date" in chat.keys() else None
+    age_text = calculate_age(birth_date) if birth_date else "Belum dapat dihitung"
+
+    growth_rows = get_growth_records(data_chat_id)
+    latest_growth = growth_rows[-1] if growth_rows else None
+    weight_text = f"{latest_growth['weight_kg']:.2f} kg" if latest_growth else "Belum ada data"
+    length_text = f"{latest_growth['length_cm']:.1f} cm" if latest_growth else "Belum ada data"
+
+    tmp_dir = tempfile.mkdtemp(prefix="babycare_weekly_")
+    pdf_path = os.path.join(
+        tmp_dir,
+        f"ringkasan_mingguan_{baby_name.replace(' ', '_')}_{end.strftime('%Y%m%d')}.pdf",
+    )
+    activity_chart = os.path.join(tmp_dir, "activity_chart.png")
+    growth_chart = os.path.join(tmp_dir, "growth_chart.png")
+
+    labels = [d["date"].strftime("%d/%m") for d in weekly]
+
+    # Grafik aktivitas mingguan
+    fig = plt.figure(figsize=(9, 5))
+    ax = fig.add_subplot(111)
+    x = list(range(7))
+    ax.plot(x, [d["asip_ml"] for d in weekly], marker="o", label="ASIP diminum (ml)")
+    ax.plot(x, [d["pump_ml"] for d in weekly], marker="o", label="Hasil pompa (ml)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_title("ASIP dan Hasil Pompa - 7 Hari")
+    ax.set_xlabel("Tanggal")
+    ax.set_ylabel("ml")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(activity_chart, dpi=160)
+    plt.close(fig)
+
+    # Grafik pertumbuhan
+    growth_for_chart = growth_rows[-12:] if growth_rows else []
+    if growth_for_chart:
+        g_labels = [
+            datetime.strptime(r["record_date"], "%Y-%m-%d").strftime("%d/%m")
+            for r in growth_for_chart
+        ]
+        weights = [r["weight_kg"] for r in growth_for_chart]
+        lengths = [r["length_cm"] for r in growth_for_chart]
+
+        fig = plt.figure(figsize=(9, 5))
+        ax1 = fig.add_subplot(111)
+        xg = list(range(len(g_labels)))
+        ax1.plot(xg, weights, marker="o", label="Berat (kg)")
+        ax1.set_xticks(xg)
+        ax1.set_xticklabels(g_labels, rotation=30)
+        ax1.set_xlabel("Tanggal")
+        ax1.set_ylabel("Berat (kg)")
+        ax1.grid(True, alpha=0.25)
+
+        ax2 = ax1.twinx()
+        ax2.plot(xg, lengths, marker="s", linestyle="--", label="Panjang (cm)")
+        ax2.set_ylabel("Panjang (cm)")
+        ax1.set_title("Perkembangan Berat dan Panjang Bayi")
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+        fig.tight_layout()
+        fig.savefig(growth_chart, dpi=160)
+        plt.close(fig)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "BabyTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=18,
+        leading=22,
+        spaceAfter=12,
+    )
+    heading = styles["Heading2"]
+    body = styles["BodyText"]
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        rightMargin=1.5 * cm,
+        leftMargin=1.5 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm,
+    )
+
+    story = []
+    story.append(Paragraph("Laporan Mingguan Baby Care", title_style))
+    story.append(
+        Paragraph(
+            f"Periode: {start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}",
+            body,
+        )
+    )
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Profil Bayi", heading))
+    profile_data = [
+        ["Nama", baby_name],
+        ["Umur", age_text],
+        ["Berat terbaru", weight_text],
+        ["Panjang terbaru", length_text],
+    ]
+    profile_table = Table(profile_data, colWidths=[4 * cm, 11 * cm])
+    profile_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(profile_table)
+    story.append(Spacer(1, 16))
+
+    total_asi = sum(d["asi_count"] for d in weekly)
+    total_asip = sum(d["asip_ml"] for d in weekly)
+    total_pump = sum(d["pump_ml"] for d in weekly)
+    total_popok = sum(d["popok_count"] for d in weekly)
+    total_sleep = sum(d["sleep_hours"] for d in weekly)
+
+    story.append(Paragraph("Ringkasan 7 Hari", heading))
+    summary_data = [
+        ["Menyusu langsung", f"{total_asi} kali"],
+        ["ASIP diminum", f"{total_asip} ml"],
+        ["Hasil pompa ASI", f"{total_pump} ml"],
+        ["Ganti popok", f"{total_popok} kali"],
+        ["Total tidur", f"{total_sleep:.1f} jam"],
+    ]
+    summary_table = Table(summary_data, colWidths=[7 * cm, 8 * cm])
+    summary_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 16))
+
+    story.append(Paragraph("Detail Harian", heading))
+    table_data = [["Tanggal", "Menyusu", "ASIP", "Pompa", "Popok", "Tidur"]]
+    for d in weekly:
+        table_data.append([
+            d["date"].strftime("%d/%m"),
+            str(d["asi_count"]),
+            f"{d['asip_ml']} ml",
+            f"{d['pump_ml']} ml",
+            str(d["popok_count"]),
+            f"{d['sleep_hours']:.1f} j",
+        ])
+
+    daily_table = Table(
+        table_data,
+        colWidths=[2.3 * cm, 2.4 * cm, 2.4 * cm, 2.4 * cm, 2.2 * cm, 2.2 * cm],
+        repeatRows=1,
+    )
+    daily_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(daily_table)
+    story.append(Spacer(1, 18))
+
+    story.append(Paragraph("Grafik Mingguan", heading))
+    story.append(Image(activity_chart, width=17 * cm, height=9.4 * cm))
+
+    if growth_for_chart:
+        story.append(PageBreak())
+        story.append(Paragraph("Grafik Perkembangan Bayi", heading))
+        story.append(Image(growth_chart, width=17 * cm, height=9.4 * cm))
+
+        growth_table_data = [["Tanggal", "Tahap", "Berat", "Panjang"]]
+        for r in growth_for_chart:
+            growth_table_data.append([
+                datetime.strptime(r["record_date"], "%Y-%m-%d").strftime("%d/%m/%Y"),
+                growth_type_label(r["record_type"]),
+                f"{r['weight_kg']:.2f} kg",
+                f"{r['length_cm']:.1f} cm",
+            ])
+        growth_table = Table(
+            growth_table_data,
+            colWidths=[4 * cm, 5 * cm, 3 * cm, 3 * cm],
+            repeatRows=1,
+        )
+        growth_table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("ALIGN", (2, 1), (-1, -1), "CENTER"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(Spacer(1, 12))
+        story.append(growth_table)
+
+    doc.build(story)
+    return pdf_path
+
+
+async def send_weekly_pdf(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    pdf_path = build_weekly_pdf(chat_id)
+    try:
+        with open(pdf_path, "rb") as pdf_file:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=pdf_file,
+                filename=os.path.basename(pdf_path),
+                caption="📄 Laporan Mingguan Baby Care",
+            )
+    finally:
+        try:
+            tmp_dir = os.path.dirname(pdf_path)
+            for name in os.listdir(tmp_dir):
+                os.remove(os.path.join(tmp_dir, name))
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+
+
+async def weekly_pdf_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await send_weekly_pdf(context, chat_id)
+
+
+def schedule_weekly_pdf(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    clear_jobs(context, chat_id, "weekly_pdf")
+    # Minggu pukul 23.59 WIB.
+    context.job_queue.run_daily(
+        weekly_pdf_job,
+        time=now_local().replace(hour=23, minute=59, second=30, microsecond=0).timetz(),
+        days=(6,),
+        chat_id=chat_id,
+        name=f"weekly_pdf_{chat_id}",
+    )
+
+
 # =========================
 # HANDLER COMMAND
 # =========================
@@ -950,6 +1280,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_chat(chat_id)
     reschedule_from_last(context, chat_id)
     schedule_daily_summary(context, chat_id)
+    schedule_weekly_pdf(context, chat_id)
 
     text = (
         "👶 Halo Ayah & Bunda!\n\n"
@@ -1482,6 +1813,22 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if data == "export_weekly_pdf":
+        await query.edit_message_text(
+            "📄 Laporan mingguan sedang dibuat...",
+            reply_markup=main_menu(),
+        )
+        try:
+            await send_weekly_pdf(context, chat_id)
+        except Exception as exc:
+            logger.exception("Gagal membuat PDF mingguan: %s", exc)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Laporan PDF mingguan gagal dibuat. Silakan coba lagi.",
+                reply_markup=main_menu(),
+            )
+        return
+
     if data == "growth_menu":
         await query.edit_message_text(
             "📏 Perkembangan Bayi\n\n"
@@ -1949,6 +2296,7 @@ async def post_init(application: Application):
     for chat_id in get_all_chats():
         reschedule_from_last(application, chat_id)
         schedule_daily_summary(application, chat_id)
+        schedule_weekly_pdf(application, chat_id)
 
     logger.info("Baby Care Bot siap berjalan dengan mode hemat resource.")
 

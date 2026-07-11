@@ -96,3 +96,9 @@ DEFAULT_SNOOZE_MINUTES=15
 - Setiap anggota dapat mengatur nama/peran seperti Ayah, Bunda, Nenek, atau Pengasuh.
 - Aktivitas penting dapat memberi notifikasi sinkronisasi ke anggota keluarga lain.
 - Reminder berjalan pada setiap akun keluarga yang sudah membuka/mengaktifkan bot.
+
+- Ringkasan harian pukul 23.59 menampilkan nama bayi, umur otomatis, berat terbaru, dan panjang terbaru.
+
+- Export PDF mingguan otomatis setiap Minggu pukul 23.59 WIB.
+- Tombol manual Export PDF Mingguan tersedia di menu utama.
+- PDF berisi nama bayi, umur, berat terbaru, panjang terbaru, ringkasan 7 hari, detail harian, grafik ASIP vs hasil pompa, dan grafik perkembangan berat/panjang.
