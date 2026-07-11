@@ -25,6 +25,7 @@ TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
 
 DEFAULT_ASI_MINUTES = int(os.getenv("DEFAULT_ASI_MINUTES", "150"))       # 2 jam 30 menit
 DEFAULT_POPOK_MINUTES = int(os.getenv("DEFAULT_POPOK_MINUTES", "240"))   # 4 jam
+DEFAULT_PUMP_MINUTES = int(os.getenv("DEFAULT_PUMP_MINUTES", "120"))      # 2 jam
 DEFAULT_SNOOZE_MINUTES = int(os.getenv("DEFAULT_SNOOZE_MINUTES", "15"))
 
 logging.basicConfig(
@@ -145,6 +146,24 @@ def last_event(chat_id: int, event_type: str):
         ).fetchone()
 
 
+def last_event_any(chat_id: int):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM events
+            WHERE chat_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+
+
+def delete_event_by_id(event_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+
+
 def today_events(chat_id: int):
     start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
@@ -201,9 +220,11 @@ def main_menu():
         [InlineKeyboardButton("🍼 Catat Menyusu", callback_data="catat_asi")],
         [InlineKeyboardButton("💩 Catat Ganti Popok", callback_data="catat_popok")],
         [InlineKeyboardButton("🥛 Catat ASIP / Formula", callback_data="menu_susu")],
+        [InlineKeyboardButton("🤱 Catat Pompa ASI", callback_data="pompa_asi")],
         [InlineKeyboardButton("😴 Mulai Tidur", callback_data="mulai_tidur"),
          InlineKeyboardButton("☀️ Bangun", callback_data="bangun_tidur")],
         [InlineKeyboardButton("📊 Statistik Hari Ini", callback_data="statistik")],
+        [InlineKeyboardButton("↩️ Hapus Input Terakhir", callback_data="reset_last")],
         [InlineKeyboardButton("👶 Profil Bayi", callback_data="profil"),
          InlineKeyboardButton("⚙️ Pengaturan", callback_data="pengaturan")],
     ])
@@ -214,6 +235,13 @@ def reminder_menu(kind: str):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Sudah Menyusu", callback_data="catat_asi")],
             [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_asi")],
+            [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+        ])
+
+    if kind == "pump":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤱 Sudah Pompa ASI", callback_data="pompa_asi")],
+            [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_pump")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
         ])
 
@@ -232,6 +260,13 @@ def milk_menu():
          InlineKeyboardButton("🥛 Formula 60 ml", callback_data="milk_formula_60")],
         [InlineKeyboardButton("✍️ Input Manual ml", callback_data="manual_milk")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
+def reset_confirm_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Ya, hapus input terakhir", callback_data="confirm_reset_last")],
+        [InlineKeyboardButton("❌ Batal", callback_data="menu")],
     ])
 
 
@@ -284,6 +319,7 @@ def reschedule_default(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     chat = get_chat(chat_id)
     schedule_once(context, chat_id, "asi", int(chat["asi_minutes"]))
     schedule_once(context, chat_id, "popok", int(chat["popok_minutes"]))
+    schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
 
 
 def reschedule_from_last(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -302,6 +338,16 @@ def reschedule_from_last(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         else:
             schedule_once(context, chat_id, kind, interval)
 
+    last_pump = last_event(chat_id, "pump")
+    if last_pump:
+        next_pump = parse_dt(last_pump["created_at"]) + timedelta(minutes=DEFAULT_PUMP_MINUTES)
+        if next_pump <= now_local():
+            schedule_once(context, chat_id, "pump", 1)
+        else:
+            schedule_at(context, chat_id, "pump", next_pump)
+    else:
+        schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
+
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
@@ -316,6 +362,15 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             "Kalau si kecil sudah menunjukkan tanda lapar, waktunya menyusu."
         )
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("asi"))
+    elif kind == "pump":
+        last = last_event(chat_id, "pump")
+        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
+        text = (
+            "🤱 Waktunya pompa ASI, Bunda ❤️\n\n"
+            f"Terakhir pompa: {last_text}\n\n"
+            "Setelah selesai, catat jumlah ASI yang berhasil dipompa ya."
+        )
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("pump"))
     else:
         last = last_event(chat_id, "popok")
         last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
@@ -340,6 +395,19 @@ def schedule_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         chat_id=chat_id,
         name=f"summary_{chat_id}",
     )
+
+
+def event_label(event_type: str) -> str:
+    labels = {
+        "asi": "🍼 Menyusu",
+        "popok": "💩 Ganti popok",
+        "asip": "🍼 ASIP",
+        "formula": "🥛 Susu formula",
+        "pump": "🤱 Pompa ASI",
+        "sleep_start": "😴 Mulai tidur",
+        "sleep_end": "☀️ Bangun",
+    }
+    return labels.get(event_type, event_type)
 
 
 # =========================
@@ -385,7 +453,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stop - hentikan reminder\n"
         "/menu - tampilkan menu\n"
         "/stats - statistik hari ini\n\n"
-        "Tips: tekan tombol setiap selesai menyusui, ganti popok, atau si kecil tidur."
+        "Tips: tekan tombol setiap selesai menyusui, ganti popok, atau si kecil tidur.\n"
+        "Kalau salah input, pilih ↩️ Hapus Input Terakhir."
     )
 
 
@@ -441,6 +510,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏰ Aku ingatkan lagi sekitar {next_time.strftime('%H:%M')}.\n\n"
             "Si kecil jadi lebih nyaman 😊",
             reply_markup=main_menu(),
+        )
+        return
+
+    if data == "pompa_asi":
+        set_state(chat_id, "WAIT_PUMP_ML")
+        await query.edit_message_text(
+            "🤱 Catat Pompa ASI\n\n"
+            "Berapa total ASI yang berhasil dipompa?\n"
+            "Ketik jumlahnya dalam ml.\n\n"
+            "Contoh: 80"
         )
         return
 
@@ -517,6 +596,76 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "reset_last":
+        last = last_event_any(chat_id)
+        if not last:
+            await query.edit_message_text(
+                "Belum ada catatan yang bisa dihapus.",
+                reply_markup=main_menu(),
+            )
+            return
+
+        label = event_label(last["event_type"])
+        time_text = parse_dt(last["created_at"]).strftime("%H:%M")
+        extra = ""
+        if last["amount_ml"]:
+            extra = f"\nJumlah: {last['amount_ml']} ml"
+
+        await query.edit_message_text(
+            f"↩️ Hapus input terakhir?\n\n"
+            f"{label}\n"
+            f"Jam: {time_text}{extra}\n\n"
+            "Data ini akan dihapus permanen.",
+            reply_markup=reset_confirm_menu(),
+        )
+        return
+
+    if data == "confirm_reset_last":
+        last = last_event_any(chat_id)
+        if not last:
+            await query.edit_message_text(
+                "Tidak ada catatan yang bisa dihapus.",
+                reply_markup=main_menu(),
+            )
+            return
+
+        deleted_type = last["event_type"]
+        label = event_label(deleted_type)
+        delete_event_by_id(int(last["id"]))
+
+        # Pulihkan jadwal reminder yang terkait setelah penghapusan
+        if deleted_type == "asi":
+            chat = get_chat(chat_id)
+            prev = last_event(chat_id, "asi")
+            if prev:
+                next_time = parse_dt(prev["created_at"]) + timedelta(minutes=int(chat["asi_minutes"]))
+                schedule_at(context, chat_id, "asi", next_time) if next_time > now_local() else schedule_once(context, chat_id, "asi", 1)
+            else:
+                schedule_once(context, chat_id, "asi", int(chat["asi_minutes"]))
+
+        elif deleted_type == "popok":
+            chat = get_chat(chat_id)
+            prev = last_event(chat_id, "popok")
+            if prev:
+                next_time = parse_dt(prev["created_at"]) + timedelta(minutes=int(chat["popok_minutes"]))
+                schedule_at(context, chat_id, "popok", next_time) if next_time > now_local() else schedule_once(context, chat_id, "popok", 1)
+            else:
+                schedule_once(context, chat_id, "popok", int(chat["popok_minutes"]))
+
+        elif deleted_type == "pump":
+            prev = last_event(chat_id, "pump")
+            if prev:
+                next_time = parse_dt(prev["created_at"]) + timedelta(minutes=DEFAULT_PUMP_MINUTES)
+                schedule_at(context, chat_id, "pump", next_time) if next_time > now_local() else schedule_once(context, chat_id, "pump", 1)
+            else:
+                schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
+
+        await query.edit_message_text(
+            f"✅ Input terakhir berhasil dihapus.\n\n{label}",
+            reply_markup=main_menu(),
+        )
+        return
+
     if data == "statistik":
         await query.edit_message_text(build_stats(chat_id), reply_markup=main_menu())
         return
@@ -576,6 +725,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "snooze_pump":
+        schedule_once(context, chat_id, "pump", DEFAULT_SNOOZE_MINUTES)
+        await query.edit_message_text(
+            f"⏰ Reminder pompa ASI ditunda {DEFAULT_SNOOZE_MINUTES} menit.",
+            reply_markup=main_menu(),
+        )
+        return
+
     if data == "snooze_popok":
         schedule_once(context, chat_id, "popok", DEFAULT_SNOOZE_MINUTES)
         await query.edit_message_text(
@@ -601,6 +758,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_state(chat_id, None)
         await update.message.reply_text(
             f"✅ Nama bayi disimpan: {text}",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if state == "WAIT_PUMP_ML":
+        try:
+            amount = int(text)
+            if amount <= 0 or amount > 1000:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Mohon ketik jumlah ASI hasil pompa dalam angka ml. Contoh: 80"
+            )
+            return
+
+        add_event(chat_id, "pump", amount_ml=amount)
+        set_state(chat_id, None)
+        schedule_once(context, chat_id, "pump", DEFAULT_PUMP_MINUTES)
+        next_pump = now_local() + timedelta(minutes=DEFAULT_PUMP_MINUTES)
+        await update.message.reply_text(
+            f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
+            f"Hasil pompa: {amount} ml\n"
+            f"Jam: {now_local().strftime('%H:%M')}\n"
+            f"⏰ Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
+            "Semangat, Bunda ❤️",
             reply_markup=main_menu(),
         )
         return
@@ -640,9 +822,11 @@ def build_stats(chat_id: int) -> str:
     count_popok = sum(1 for e in events if e["event_type"] == "popok")
     count_asip = sum(1 for e in events if e["event_type"] == "asip")
     count_formula = sum(1 for e in events if e["event_type"] == "formula")
+    count_pump = sum(1 for e in events if e["event_type"] == "pump")
 
     ml_asip = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "asip")
     ml_formula = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "formula")
+    ml_pump = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "pump")
 
     sleep_minutes = 0
     for e in events:
@@ -666,7 +850,8 @@ def build_stats(chat_id: int) -> str:
         f"💩 Ganti popok: {count_popok} kali\n"
         f"😴 Tidur: {sleep_h} jam {sleep_m} menit\n\n"
         f"🍼 ASIP: {count_asip} kali / {ml_asip} ml\n"
-        f"🥛 Formula: {count_formula} kali / {ml_formula} ml\n\n"
+        f"🥛 Formula: {count_formula} kali / {ml_formula} ml\n"
+        f"🤱 Pompa ASI: {count_pump} kali / {ml_pump} ml\n\n"
         f"Terakhir menyusu: {last_asi_text}\n"
         f"Terakhir ganti popok: {last_popok_text}\n\n"
         "Semangat ya, Ayah & Bunda ❤️"

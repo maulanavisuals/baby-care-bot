@@ -7,6 +7,7 @@ Bot Telegram untuk membantu Ayah & Bunda mencatat dan mengingat:
 - Tidur
 - Statistik harian
 - Reminder otomatis
+- Hapus/reset input terakhir jika salah mencatat
 
 ## File
 
