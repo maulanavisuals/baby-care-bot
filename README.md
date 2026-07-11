@@ -78,3 +78,8 @@ DEFAULT_SNOOZE_MINUTES=15
 - Dashboard jadwal berikutnya.
 - Riwayat 10 catatan terakhir.
 - Statistik 7 hari terakhir.
+
+- Menu Catat ASIP sekarang khusus ASIP.
+- Pilihan cepat 30, 60, 90, 120, 150, 180 ml dan input manual.
+- Reminder ASIP memakai audio alarm dan berulang setiap 15 menit sampai jumlah ml dicatat.
+- Setelah dicatat, reminder ASIP berikutnya mengikuti interval menyusu.

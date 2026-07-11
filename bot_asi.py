@@ -274,7 +274,7 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🍼 Menyusu Langsung", callback_data="menu_menyusu")],
         [InlineKeyboardButton("💩 Catat Popok", callback_data="menu_popok")],
-        [InlineKeyboardButton("🥛 Catat ASIP / Formula", callback_data="menu_susu")],
+        [InlineKeyboardButton("🍼 Catat ASIP", callback_data="menu_susu")],
         [InlineKeyboardButton("🤱 Catat Pompa ASI", callback_data="pompa_asi")],
         [InlineKeyboardButton("😴 Mulai Tidur", callback_data="mulai_tidur"),
          InlineKeyboardButton("☀️ Bangun", callback_data="bangun_tidur")],
@@ -300,6 +300,13 @@ def reminder_menu(kind: str):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🤱 Sudah Pompa ASI", callback_data="pompa_asi")],
             [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_pump")],
+            [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+        ])
+
+    if kind == "asip":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🍼 Sudah Minum ASIP", callback_data="menu_susu")],
+            [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_asip")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
         ])
 
@@ -344,19 +351,14 @@ def pump_amount_menu():
 
 def milk_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍼 ASIP 30 ml", callback_data="milk_asip_30"),
-         InlineKeyboardButton("🍼 ASIP 60 ml", callback_data="milk_asip_60")],
-        [InlineKeyboardButton("🥛 Formula 30 ml", callback_data="milk_formula_30"),
-         InlineKeyboardButton("🥛 Formula 60 ml", callback_data="milk_formula_60")],
-        [InlineKeyboardButton("✍️ Input Manual ml", callback_data="manual_milk")],
+        [InlineKeyboardButton("30 ml", callback_data="asip_30"),
+         InlineKeyboardButton("60 ml", callback_data="asip_60"),
+         InlineKeyboardButton("90 ml", callback_data="asip_90")],
+        [InlineKeyboardButton("120 ml", callback_data="asip_120"),
+         InlineKeyboardButton("150 ml", callback_data="asip_150"),
+         InlineKeyboardButton("180 ml", callback_data="asip_180")],
+        [InlineKeyboardButton("✍️ Input Manual", callback_data="asip_manual")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
-    ])
-
-
-def reset_confirm_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Ya, hapus input terakhir", callback_data="confirm_reset_last")],
-        [InlineKeyboardButton("❌ Batal", callback_data="menu")],
     ])
 
 
@@ -444,6 +446,16 @@ def reschedule_from_last(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         else:
             schedule_once(context, chat_id, kind, interval)
 
+    last_asip = last_event(chat_id, "asip")
+    if last_asip:
+        next_asip = parse_dt(last_asip["created_at"]) + timedelta(minutes=int(chat["asi_minutes"]))
+        if next_asip <= now_local():
+            schedule_once(context, chat_id, "asip", 1)
+        else:
+            schedule_at(context, chat_id, "asip", next_asip)
+    else:
+        schedule_once(context, chat_id, "asip", int(chat["asi_minutes"]))
+
     last_pump = last_event(chat_id, "pump")
     if last_pump:
         next_pump = parse_dt(last_pump["created_at"]) + timedelta(minutes=DEFAULT_PUMP_MINUTES)
@@ -486,6 +498,20 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             "asi",
             DEFAULT_REPEAT_REMINDER_MINUTES
         )
+
+    elif kind == "asip":
+        last = last_event(chat_id, "asip")
+        last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
+        text = (
+            "🍼 Waktunya ASIP untuk si kecil ❤️\n\n"
+            f"Terakhir minum ASIP: {last_text}\n\n"
+            f"Setelah diberikan, catat jumlah ml yang diminum. "
+            f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
+            f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
+        )
+        await send_alarm_audio(context, chat_id, "🚨 Alarm ASIP — waktunya si kecil minum ASIP.")
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("asip"))
+        schedule_once(context, chat_id, "asip", DEFAULT_REPEAT_REMINDER_MINUTES)
 
     elif kind == "pump":
         last = last_event(chat_id, "pump")
@@ -879,28 +905,30 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_susu":
-        await query.edit_message_text("🥛 Pilih jenis susu dan jumlahnya:", reply_markup=milk_menu())
+        await query.edit_message_text("🍼 Berapa ml ASIP yang diminum si kecil?", reply_markup=milk_menu())
         return
 
-    if data.startswith("milk_"):
-        _, milk_type, amount = data.split("_")
-        event_type = "asip" if milk_type == "asip" else "formula"
-        add_event(chat_id, event_type, amount_ml=int(amount))
-        label = "ASIP" if event_type == "asip" else "Susu formula"
+    if data.startswith("asip_") and data != "asip_manual":
+        amount = int(data.split("_")[-1])
+        add_event(chat_id, "asip", amount_ml=amount)
+        chat = get_chat(chat_id)
+        schedule_once(context, chat_id, "asip", int(chat["asi_minutes"]))
+        next_asip = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
         await query.edit_message_text(
-            f"✅ {label} tercatat.\n\n"
-            f"Jumlah: {amount} ml\n"
-            f"Jam: {now_local().strftime('%H:%M')}",
+            f"✅ ASIP tercatat.\n\n"
+            f"Jumlah diminum: {amount} ml\n"
+            f"Jam: {now_local().strftime('%H:%M')}\n"
+            f"⏰ Reminder ASIP berikutnya sekitar {next_asip.strftime('%H:%M')}.",
             reply_markup=main_menu(),
         )
         return
 
-    if data == "manual_milk":
-        set_state(chat_id, "WAIT_MILK")
+    if data == "asip_manual":
+        set_state(chat_id, "WAIT_ASIP_ML")
         await query.edit_message_text(
-            "✍️ Ketik jumlah susu dalam ml.\n\n"
-            "Contoh: 60\n\n"
-            "Catatan: default akan dicatat sebagai susu formula."
+            "✍️ Input Manual ASIP\n\n"
+            "Ketik jumlah ASIP yang diminum dalam ml.\n\n"
+            "Contoh: 75"
         )
         return
 
@@ -1038,6 +1066,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⏳ Dashboard Jadwal\n\n"
             f"🍼 Menyusu: {next_text('asi', int(chat['asi_minutes']))}\n"
             f"🤱 Pompa ASI: {next_text('pump', DEFAULT_PUMP_MINUTES)}\n"
+            f"🍼 ASIP: {next_text('asip', int(chat['asi_minutes']))}\n"
             f"💩 Cek popok: {next_text('popok', int(chat['popok_minutes']))}"
         )
         await query.edit_message_text(text, reply_markup=main_menu())
@@ -1088,7 +1117,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱️ Durasi menyusu: {format_duration_minutes(bf_minutes)}\n"
             f"🤱 Pompa ASI: {count_pump} kali / {ml_pump} ml\n"
             f"🍼 ASIP diminum: {ml_asip} ml\n"
-            f"🥛 Formula: {ml_formula} ml\n"
+
             f"💩 Ganti popok: {count_popok} kali\n"
             f"😴 Total tidur: {format_duration_minutes(sleep_minutes)}"
         )
@@ -1170,6 +1199,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_once(context, chat_id, "asi", DEFAULT_SNOOZE_MINUTES)
         await query.edit_message_text(
             f"⏰ Reminder menyusu ditunda {DEFAULT_SNOOZE_MINUTES} menit.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if data == "snooze_asip":
+        schedule_once(context, chat_id, "asip", DEFAULT_SNOOZE_MINUTES)
+        await query.edit_message_text(
+            f"⏰ Reminder ASIP ditunda {DEFAULT_SNOOZE_MINUTES} menit.",
             reply_markup=main_menu(),
         )
         return
@@ -1261,6 +1298,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if state == "WAIT_ASIP_ML":
+        try:
+            amount = int(text)
+            if amount <= 0 or amount > 500:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Mohon ketik jumlah ASIP dalam angka ml. Contoh: 75")
+            return
+
+        add_event(chat_id, "asip", amount_ml=amount)
+        set_state(chat_id, None)
+        chat = get_chat(chat_id)
+        schedule_once(context, chat_id, "asip", int(chat["asi_minutes"]))
+        next_asip = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
+        await update.message.reply_text(
+            f"✅ ASIP tercatat.\n\n"
+            f"Jumlah diminum: {amount} ml\n"
+            f"Jam: {now_local().strftime('%H:%M')}\n"
+            f"⏰ Reminder ASIP berikutnya sekitar {next_asip.strftime('%H:%M')}.",
+            reply_markup=main_menu(),
+        )
+        return
+
     if state == "WAIT_MILK":
         try:
             amount = int(text)
@@ -1330,7 +1390,7 @@ def build_stats(chat_id: int) -> str:
         f"   💧 Pipis: {count_pipis} | 💩 BAB: {count_bab} | 💧💩 Keduanya: {count_keduanya}\n"
         f"😴 Tidur: {sleep_h} jam {sleep_m} menit\n\n"
         f"🍼 ASIP: {count_asip} kali / {ml_asip} ml\n"
-        f"🥛 Formula: {count_formula} kali / {ml_formula} ml\n"
+
         f"🤱 Pompa ASI: {count_pump} kali / {ml_pump} ml\n\n"
         f"Terakhir menyusu: {last_asi_text}\n"
         f"Terakhir ganti popok: {last_popok_text}\n\n"
