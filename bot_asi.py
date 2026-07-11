@@ -272,13 +272,16 @@ def format_birth_date(birth_date_str: str) -> str:
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍼 Catat Menyusu", callback_data="catat_asi")],
-        [InlineKeyboardButton("💩 Catat Ganti Popok", callback_data="catat_popok")],
+        [InlineKeyboardButton("🍼 Menyusu Langsung", callback_data="menu_menyusu")],
+        [InlineKeyboardButton("💩 Catat Popok", callback_data="menu_popok")],
         [InlineKeyboardButton("🥛 Catat ASIP / Formula", callback_data="menu_susu")],
         [InlineKeyboardButton("🤱 Catat Pompa ASI", callback_data="pompa_asi")],
         [InlineKeyboardButton("😴 Mulai Tidur", callback_data="mulai_tidur"),
          InlineKeyboardButton("☀️ Bangun", callback_data="bangun_tidur")],
-        [InlineKeyboardButton("📊 Statistik Hari Ini", callback_data="statistik")],
+        [InlineKeyboardButton("⏳ Dashboard Jadwal", callback_data="dashboard")],
+        [InlineKeyboardButton("📊 Statistik Hari Ini", callback_data="statistik"),
+         InlineKeyboardButton("📈 Statistik 7 Hari", callback_data="statistik_7")],
+        [InlineKeyboardButton("🕘 Riwayat Terakhir", callback_data="riwayat")],
         [InlineKeyboardButton("↩️ Hapus Input Terakhir", callback_data="reset_last")],
         [InlineKeyboardButton("👶 Profil Bayi", callback_data="profil"),
          InlineKeyboardButton("⚙️ Pengaturan", callback_data="pengaturan")],
@@ -303,6 +306,25 @@ def reminder_menu(kind: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Sudah Ganti Popok", callback_data="catat_popok")],
         [InlineKeyboardButton("⏰ Tunda 15 Menit", callback_data="snooze_popok")],
+        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
+def breastfeeding_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Mulai Kiri", callback_data="bf_start_left"),
+         InlineKeyboardButton("▶️ Mulai Kanan", callback_data="bf_start_right")],
+        [InlineKeyboardButton("⏹️ Selesai Menyusu", callback_data="bf_stop")],
+        [InlineKeyboardButton("✅ Catat Cepat Tanpa Timer", callback_data="catat_asi")],
+        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
+    ])
+
+
+def diaper_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💧 Pipis", callback_data="popok_pipis"),
+         InlineKeyboardButton("💩 BAB", callback_data="popok_bab")],
+        [InlineKeyboardButton("💧💩 Pipis + BAB", callback_data="popok_keduanya")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
     ])
 
@@ -566,6 +588,43 @@ def schedule_daily_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     )
 
 
+def format_duration_minutes(total_minutes: int) -> str:
+    h = total_minutes // 60
+    m = total_minutes % 60
+    if h and m:
+        return f"{h} jam {m} menit"
+    if h:
+        return f"{h} jam"
+    return f"{m} menit"
+
+
+def recent_events(chat_id: int, limit: int = 10):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM events
+            WHERE chat_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+
+
+def events_between(chat_id: int, start: datetime, end: datetime):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM events
+            WHERE chat_id = ?
+              AND datetime(created_at) >= datetime(?)
+              AND datetime(created_at) < datetime(?)
+            ORDER BY created_at ASC
+            """,
+            (chat_id, iso(start), iso(end)),
+        ).fetchall()
+
+
 def event_label(event_type: str) -> str:
     labels = {
         "asi": "🍼 Menyusu",
@@ -575,6 +634,12 @@ def event_label(event_type: str) -> str:
         "pump": "🤱 Pompa ASI",
         "sleep_start": "😴 Mulai tidur",
         "sleep_end": "☀️ Bangun",
+        "bf_start_left": "🍼 Mulai menyusu kiri",
+        "bf_start_right": "🍼 Mulai menyusu kanan",
+        "bf_session": "🍼 Sesi menyusu",
+        "popok_pipis": "💧 Popok pipis",
+        "popok_bab": "💩 Popok BAB",
+        "popok_keduanya": "💧💩 Popok pipis + BAB",
     }
     return labels.get(event_type, event_type)
 
@@ -656,6 +721,97 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         await query.edit_message_text("👶 Menu Baby Care Bot", reply_markup=main_menu())
+        return
+
+    if data == "menu_menyusu":
+        await query.edit_message_text(
+            "🍼 Menyusu Langsung\n\n"
+            "Pilih sisi untuk mulai timer, atau catat cepat tanpa timer.",
+            reply_markup=breastfeeding_menu(),
+        )
+        return
+
+    if data in {"bf_start_left", "bf_start_right"}:
+        last_left = last_event(chat_id, "bf_start_left")
+        last_right = last_event(chat_id, "bf_start_right")
+        last_session = last_event(chat_id, "bf_session")
+
+        latest_start = None
+        if last_left and last_right:
+            latest_start = last_left if parse_dt(last_left["created_at"]) > parse_dt(last_right["created_at"]) else last_right
+        else:
+            latest_start = last_left or last_right
+
+        if latest_start and (not last_session or parse_dt(latest_start["created_at"]) > parse_dt(last_session["created_at"])):
+            await query.edit_message_text(
+                "⏱️ Timer menyusu masih berjalan. Tekan ⏹️ Selesai Menyusu dulu.",
+                reply_markup=breastfeeding_menu(),
+            )
+            return
+
+        add_event(chat_id, data)
+        side = "kiri" if data == "bf_start_left" else "kanan"
+        await query.edit_message_text(
+            f"🍼 Timer menyusu {side} dimulai pukul {now_local().strftime('%H:%M')}.",
+            reply_markup=breastfeeding_menu(),
+        )
+        return
+
+    if data == "bf_stop":
+        last_left = last_event(chat_id, "bf_start_left")
+        last_right = last_event(chat_id, "bf_start_right")
+        latest = None
+        if last_left and last_right:
+            latest = last_left if parse_dt(last_left["created_at"]) > parse_dt(last_right["created_at"]) else last_right
+        else:
+            latest = last_left or last_right
+
+        last_session = last_event(chat_id, "bf_session")
+        if not latest or (last_session and parse_dt(last_session["created_at"]) > parse_dt(latest["created_at"])):
+            await query.edit_message_text(
+                "Belum ada timer menyusu yang berjalan.",
+                reply_markup=breastfeeding_menu(),
+            )
+            return
+
+        start_dt = parse_dt(latest["created_at"])
+        end_dt = now_local()
+        duration_min = max(1, int((end_dt - start_dt).total_seconds() // 60))
+        side = "kiri" if latest["event_type"] == "bf_start_left" else "kanan"
+
+        add_event(chat_id, "bf_session", amount_ml=duration_min, started_at=start_dt, ended_at=end_dt)
+        add_event(chat_id, "asi")
+
+        chat = get_chat(chat_id)
+        schedule_once(context, chat_id, "asi", int(chat["asi_minutes"]))
+        next_time = now_local() + timedelta(minutes=int(chat["asi_minutes"]))
+
+        await query.edit_message_text(
+            f"✅ Menyusu selesai.\n\n"
+            f"Sisi: {side}\n"
+            f"Durasi: {duration_min} menit\n"
+            f"⏰ Reminder berikutnya sekitar {next_time.strftime('%H:%M')}.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if data == "menu_popok":
+        await query.edit_message_text(
+            "💩 Catat Popok\n\nPilih kondisi popok:",
+            reply_markup=diaper_menu(),
+        )
+        return
+
+    if data in {"popok_pipis", "popok_bab", "popok_keduanya"}:
+        add_event(chat_id, data)
+        add_event(chat_id, "popok")
+        chat = get_chat(chat_id)
+        schedule_once(context, chat_id, "popok", int(chat["popok_minutes"]))
+        label = event_label(data)
+        await query.edit_message_text(
+            f"✅ {label} tercatat pukul {now_local().strftime('%H:%M')}.",
+            reply_markup=main_menu(),
+        )
         return
 
     if data == "catat_asi":
@@ -865,6 +1021,80 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "dashboard":
+        chat = get_chat(chat_id)
+
+        def next_text(kind, minutes):
+            last = last_event(chat_id, kind)
+            if not last:
+                return "belum ada catatan"
+            next_dt = parse_dt(last["created_at"]) + timedelta(minutes=minutes)
+            delta = int((next_dt - now_local()).total_seconds() // 60)
+            if delta <= 0:
+                return "sekarang / sudah lewat"
+            return f"{format_duration_minutes(delta)} lagi ({next_dt.strftime('%H:%M')})"
+
+        text = (
+            "⏳ Dashboard Jadwal\n\n"
+            f"🍼 Menyusu: {next_text('asi', int(chat['asi_minutes']))}\n"
+            f"🤱 Pompa ASI: {next_text('pump', DEFAULT_PUMP_MINUTES)}\n"
+            f"💩 Cek popok: {next_text('popok', int(chat['popok_minutes']))}"
+        )
+        await query.edit_message_text(text, reply_markup=main_menu())
+        return
+
+    if data == "riwayat":
+        rows = recent_events(chat_id, 10)
+        if not rows:
+            text = "Belum ada riwayat."
+        else:
+            lines = ["🕘 10 Catatan Terakhir", ""]
+            for r in rows:
+                label = event_label(r["event_type"])
+                t = parse_dt(r["created_at"]).strftime("%d/%m %H:%M")
+                extra = ""
+                if r["event_type"] in {"asip", "formula", "pump"} and r["amount_ml"]:
+                    extra = f" — {r['amount_ml']} ml"
+                elif r["event_type"] == "bf_session" and r["amount_ml"]:
+                    extra = f" — {r['amount_ml']} menit"
+                lines.append(f"• {t} | {label}{extra}")
+            text = "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=main_menu())
+        return
+
+    if data == "statistik_7":
+        end = now_local()
+        start = end - timedelta(days=7)
+        events = events_between(chat_id, start, end)
+
+        count_asi = sum(1 for e in events if e["event_type"] == "asi")
+        count_popok = sum(1 for e in events if e["event_type"] == "popok")
+        count_pump = sum(1 for e in events if e["event_type"] == "pump")
+        ml_pump = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "pump")
+        ml_asip = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "asip")
+        ml_formula = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "formula")
+        sleep_minutes = 0
+        bf_minutes = 0
+
+        for e in events:
+            if e["event_type"] == "sleep_end" and e["started_at"] and e["ended_at"]:
+                sleep_minutes += max(0, int((parse_dt(e["ended_at"]) - parse_dt(e["started_at"])).total_seconds() // 60))
+            if e["event_type"] == "bf_session" and e["amount_ml"]:
+                bf_minutes += int(e["amount_ml"])
+
+        text = (
+            "📈 Statistik 7 Hari Terakhir\n\n"
+            f"🍼 Menyusu: {count_asi} kali\n"
+            f"⏱️ Durasi menyusu: {format_duration_minutes(bf_minutes)}\n"
+            f"🤱 Pompa ASI: {count_pump} kali / {ml_pump} ml\n"
+            f"🍼 ASIP diminum: {ml_asip} ml\n"
+            f"🥛 Formula: {ml_formula} ml\n"
+            f"💩 Ganti popok: {count_popok} kali\n"
+            f"😴 Total tidur: {format_duration_minutes(sleep_minutes)}"
+        )
+        await query.edit_message_text(text, reply_markup=main_menu())
+        return
+
     if data == "statistik":
         await query.edit_message_text(build_stats(chat_id), reply_markup=main_menu())
         return
@@ -1067,6 +1297,10 @@ def build_stats(chat_id: int) -> str:
     count_asip = sum(1 for e in events if e["event_type"] == "asip")
     count_formula = sum(1 for e in events if e["event_type"] == "formula")
     count_pump = sum(1 for e in events if e["event_type"] == "pump")
+    count_pipis = sum(1 for e in events if e["event_type"] == "popok_pipis")
+    count_bab = sum(1 for e in events if e["event_type"] == "popok_bab")
+    count_keduanya = sum(1 for e in events if e["event_type"] == "popok_keduanya")
+    bf_minutes = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "bf_session")
 
     ml_asip = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "asip")
     ml_formula = sum((e["amount_ml"] or 0) for e in events if e["event_type"] == "formula")
@@ -1091,7 +1325,9 @@ def build_stats(chat_id: int) -> str:
     return (
         "📊 Catatan Hari Ini\n\n"
         f"🍼 Menyusu: {count_asi} kali\n"
+        f"⏱️ Durasi menyusu: {format_duration_minutes(bf_minutes)}\n"
         f"💩 Ganti popok: {count_popok} kali\n"
+        f"   💧 Pipis: {count_pipis} | 💩 BAB: {count_bab} | 💧💩 Keduanya: {count_keduanya}\n"
         f"😴 Tidur: {sleep_h} jam {sleep_m} menit\n\n"
         f"🍼 ASIP: {count_asip} kali / {ml_asip} ml\n"
         f"🥛 Formula: {count_formula} kali / {ml_formula} ml\n"

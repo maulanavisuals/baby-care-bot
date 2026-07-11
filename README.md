@@ -72,3 +72,9 @@ DEFAULT_SNOOZE_MINUTES=15
 - Reminder menyusu dan pompa ASI sekarang mengirim audio alarm.
 - Audio alarm akan ikut terkirim setiap 15 menit sampai aktivitas dikonfirmasi.
 - Pastikan file `alarm.wav` ikut di-upload ke GitHub.
+
+- Timer menyusu kiri/kanan dan durasi otomatis.
+- Detail popok: pipis, BAB, atau keduanya.
+- Dashboard jadwal berikutnya.
+- Riwayat 10 catatan terakhir.
+- Statistik 7 hari terakhir.
