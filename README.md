@@ -64,3 +64,11 @@ DEFAULT_SNOOZE_MINUTES=15
 - Ringkasan harian menampilkan hari dan tanggal lengkap dalam Bahasa Indonesia.
 
 - Catatan pompa ASI menyediakan pilihan cepat 30–180 ml dan input jumlah ml secara manual.
+
+- Profil bayi menyimpan tanggal lahir dan menghitung umur otomatis dalam tahun, bulan, dan hari.
+
+- Reminder menyusu dan pompa ASI akan diulang setiap 15 menit sampai aktivitas dicatat.
+
+- Reminder menyusu dan pompa ASI sekarang mengirim audio alarm.
+- Audio alarm akan ikut terkirim setiap 15 menit sampai aktivitas dikonfirmasi.
+- Pastikan file `alarm.wav` ikut di-upload ke GitHub.

@@ -21,12 +21,14 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "baby_care.db")
+ALARM_FILE = os.getenv("ALARM_FILE", "alarm.wav")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
 
 DEFAULT_ASI_MINUTES = int(os.getenv("DEFAULT_ASI_MINUTES", "150"))       # 2 jam 30 menit
 DEFAULT_POPOK_MINUTES = int(os.getenv("DEFAULT_POPOK_MINUTES", "240"))   # 4 jam
 DEFAULT_PUMP_MINUTES = int(os.getenv("DEFAULT_PUMP_MINUTES", "120"))      # 2 jam
 DEFAULT_SNOOZE_MINUTES = int(os.getenv("DEFAULT_SNOOZE_MINUTES", "15"))
+DEFAULT_REPEAT_REMINDER_MINUTES = int(os.getenv("DEFAULT_REPEAT_REMINDER_MINUTES", "15"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -78,6 +80,11 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # Migrasi database lama: tambahkan kolom tanggal lahir jika belum ada
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(chats)").fetchall()]
+        if "birth_date" not in columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN birth_date TEXT")
 
 
 def now_local() -> datetime:
@@ -213,6 +220,52 @@ def update_baby_name(chat_id: int, name: str):
         conn.execute("UPDATE chats SET baby_name = ? WHERE chat_id = ?", (name, chat_id))
 
 
+def update_birth_date(chat_id: int, birth_date: str):
+    with db() as conn:
+        conn.execute("UPDATE chats SET birth_date = ? WHERE chat_id = ?", (birth_date, chat_id))
+
+
+def calculate_age(birth_date_str: str) -> str:
+    birth = datetime.strptime(birth_date_str, "%Y-%m-%d").date()
+    today = now_local().date()
+
+    if birth > today:
+        return "Tanggal lahir tidak valid"
+
+    years = today.year - birth.year
+    months = today.month - birth.month
+    days = today.day - birth.day
+
+    if days < 0:
+        months -= 1
+        prev_month = today.month - 1 or 12
+        prev_year = today.year if today.month > 1 else today.year - 1
+        import calendar
+        days += calendar.monthrange(prev_year, prev_month)[1]
+
+    if months < 0:
+        years -= 1
+        months += 12
+
+    parts = []
+    if years > 0:
+        parts.append(f"{years} tahun")
+    if months > 0 or years > 0:
+        parts.append(f"{months} bulan")
+    parts.append(f"{days} hari")
+    return " ".join(parts)
+
+
+def format_birth_date(birth_date_str: str) -> str:
+    nama_bulan = {
+        1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
+        5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
+        9: "September", 10: "Oktober", 11: "November", 12: "Desember"
+    }
+    d = datetime.strptime(birth_date_str, "%Y-%m-%d").date()
+    return f"{d.day} {nama_bulan[d.month]} {d.year}"
+
+
 # =========================
 # TAMPILAN MENU
 # =========================
@@ -294,8 +347,24 @@ def settings_menu():
          InlineKeyboardButton("💩 Popok 4 jam", callback_data="set_popok_240"),
          InlineKeyboardButton("💩 Popok 5 jam", callback_data="set_popok_300")],
         [InlineKeyboardButton("👶 Ubah Nama Bayi", callback_data="ubah_nama")],
+        [InlineKeyboardButton("📅 Atur Tanggal Lahir", callback_data="ubah_tanggal_lahir")],
         [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu")],
     ])
+
+
+async def send_alarm_audio(context: ContextTypes.DEFAULT_TYPE, chat_id: int, caption: str):
+    """Kirim audio alarm. Jika file gagal dikirim, reminder teks tetap berjalan."""
+    try:
+        with open(ALARM_FILE, "rb") as audio:
+            await context.bot.send_audio(
+                chat_id=chat_id,
+                audio=audio,
+                caption=caption,
+                title="Baby Care Alarm",
+                performer="Baby Care Bot",
+            )
+    except Exception as exc:
+        logger.warning("Gagal mengirim audio alarm ke %s: %s", chat_id, exc)
 
 
 # =========================
@@ -372,20 +441,58 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         last = last_event(chat_id, "asi")
         last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
         text = (
-            "🍼 Waktunya cek si kecil ya, Ayah & Bunda ❤️\n\n"
+            "🍼 Waktunya menyusu ya, Ayah & Bunda ❤️\n\n"
             f"Terakhir menyusu: {last_text}\n\n"
-            "Kalau si kecil sudah menunjukkan tanda lapar, waktunya menyusu."
+            f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
+            f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("asi"))
+        await send_alarm_audio(
+            context,
+            chat_id,
+            "🚨 Alarm menyusu — segera cek si kecil ya."
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reminder_menu("asi")
+        )
+
+        # Ulangi terus sampai ada input menyusu baru.
+        schedule_once(
+            context,
+            chat_id,
+            "asi",
+            DEFAULT_REPEAT_REMINDER_MINUTES
+        )
+
     elif kind == "pump":
         last = last_event(chat_id, "pump")
         last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
         text = (
             "🤱 Waktunya pompa ASI, Bunda ❤️\n\n"
             f"Terakhir pompa: {last_text}\n\n"
-            "Setelah selesai, catat jumlah ASI yang berhasil dipompa ya."
+            f"Kalau belum dicatat, aku akan mengingatkan lagi dalam "
+            f"{DEFAULT_REPEAT_REMINDER_MINUTES} menit."
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("pump"))
+        await send_alarm_audio(
+            context,
+            chat_id,
+            "🚨 Alarm pompa ASI — waktunya pompa ya, Bunda."
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reminder_menu("pump")
+        )
+
+        # Ulangi terus sampai hasil pompa dicatat.
+        schedule_once(
+            context,
+            chat_id,
+            "pump",
+            DEFAULT_REPEAT_REMINDER_MINUTES
+        )
+
     else:
         last = last_event(chat_id, "popok")
         last_text = parse_dt(last["created_at"]).strftime("%H:%M") if last else "belum ada catatan"
@@ -394,7 +501,11 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             f"Terakhir ganti popok: {last_text}\n\n"
             "Kalau sudah basah atau penuh, sebaiknya diganti supaya tetap nyaman."
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reminder_menu("popok"))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reminder_menu("popok")
+        )
 
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
@@ -555,7 +666,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"🎉 Sip, menyusu sudah tercatat!\n\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
-            f"⏰ Aku ingatkan lagi sekitar {next_time.strftime('%H:%M')}.\n\n"
+            f"⏰ Reminder berulang dihentikan.\n"
+            f"Aku ingatkan lagi sekitar {next_time.strftime('%H:%M')}.\n\n"
             "Semoga si kecil kenyang ya ❤️",
             reply_markup=main_menu(),
         )
@@ -594,7 +706,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
             f"Hasil pompa: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
-            f"⏰ Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
+            f"⏰ Reminder berulang dihentikan.\n"
+            f"Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
             "Semangat, Bunda ❤️",
             reply_markup=main_menu(),
         )
@@ -759,10 +872,21 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "profil":
         chat = get_chat(chat_id)
         baby_name = chat["baby_name"] or "belum diisi"
+        birth_date = chat["birth_date"] if "birth_date" in chat.keys() else None
+
+        if birth_date:
+            birth_text = format_birth_date(birth_date)
+            age_text = calculate_age(birth_date)
+        else:
+            birth_text = "belum diisi"
+            age_text = "belum dapat dihitung"
+
         await query.edit_message_text(
             f"👶 Profil Bayi\n\n"
-            f"Nama: {baby_name}\n\n"
-            "Untuk mengubah nama, buka ⚙️ Pengaturan lalu pilih 👶 Ubah Nama Bayi.",
+            f"Nama: {baby_name}\n"
+            f"📅 Tanggal lahir: {birth_text}\n"
+            f"🎂 Umur: {age_text}\n\n"
+            "Umur akan dihitung otomatis setiap hari.",
             reply_markup=main_menu(),
         )
         return
@@ -801,6 +925,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ubah_nama":
         set_state(chat_id, "WAIT_BABY_NAME")
         await query.edit_message_text("👶 Ketik nama bayi ya.")
+        return
+
+    if data == "ubah_tanggal_lahir":
+        set_state(chat_id, "WAIT_BIRTH_DATE")
+        await query.edit_message_text(
+            "📅 Ketik tanggal lahir bayi dengan format:\n\n"
+            "DD-MM-YYYY\n\n"
+            "Contoh: 03-07-2026"
+        )
         return
 
     if data == "snooze_asi":
@@ -848,6 +981,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if state == "WAIT_BIRTH_DATE":
+        try:
+            birth = datetime.strptime(text, "%d-%m-%Y").date()
+            if birth > now_local().date():
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Tanggal tidak valid. Gunakan format DD-MM-YYYY.\n\n"
+                "Contoh: 03-07-2026"
+            )
+            return
+
+        stored_date = birth.strftime("%Y-%m-%d")
+        update_birth_date(chat_id, stored_date)
+        set_state(chat_id, None)
+
+        await update.message.reply_text(
+            f"✅ Tanggal lahir berhasil disimpan.\n\n"
+            f"📅 {format_birth_date(stored_date)}\n"
+            f"🎂 Umur sekarang: {calculate_age(stored_date)}",
+            reply_markup=main_menu(),
+        )
+        return
+
     if state == "WAIT_PUMP_ML":
         try:
             amount = int(text)
@@ -867,7 +1024,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤱 Pompa ASI berhasil dicatat ✅\n\n"
             f"Hasil pompa: {amount} ml\n"
             f"Jam: {now_local().strftime('%H:%M')}\n"
-            f"⏰ Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
+            f"⏰ Reminder berulang dihentikan.\n"
+            f"Jadwal pompa berikutnya sekitar {next_pump.strftime('%H:%M')}.\n\n"
             "Semangat, Bunda ❤️",
             reply_markup=main_menu(),
         )
